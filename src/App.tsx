@@ -120,7 +120,7 @@ type CommandPaletteCommand = {
 const allCollectionsFilter = "__sessiondex_all_collections__";
 const unassignedCollectionFilter = "__sessiondex_unassigned_collection__";
 const secondsPerDay = 24 * 60 * 60;
-const autoRefreshIntervalMs = 12_000;
+const autoRefreshIntervalMs = 30_000;
 const customSessionNameMaxLength = 100;
 const collectionNameMaxLength = 48;
 const tagNameMaxLength = 32;
@@ -843,6 +843,7 @@ function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const loadDataPromiseRef = useRef<Promise<void> | null>(null);
+  const searchPromiseRef = useRef<Promise<SessionSearchResult[]> | null>(null);
   const lastRefreshStartedAtRef = useRef(0);
 
   useEffect(() => {
@@ -1050,25 +1051,48 @@ function App() {
     setSearchMatches([]);
     setSearching(true);
 
+    async function runSearch() {
+      const activeSearch = searchPromiseRef.current;
+
+      if (activeSearch) {
+        try {
+          await activeSearch;
+        } catch {
+          // The active request reports its own failure.
+        }
+      }
+
+      if (cancelled) {
+        return;
+      }
+
+      const searchPromise = api.searchSessions(query, providerFilter);
+      searchPromiseRef.current = searchPromise;
+
+      try {
+        const results = await searchPromise;
+
+        if (!cancelled) {
+          setSearchMatches(results);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setSearchMatches([]);
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      } finally {
+        if (searchPromiseRef.current === searchPromise) {
+          searchPromiseRef.current = null;
+        }
+
+        if (!cancelled) {
+          setSearching(false);
+        }
+      }
+    }
+
     const timeoutId = window.setTimeout(() => {
-      void api
-        .searchSessions(query, providerFilter)
-        .then((results) => {
-          if (!cancelled) {
-            setSearchMatches(results);
-          }
-        })
-        .catch((err) => {
-          if (!cancelled) {
-            setSearchMatches([]);
-            setError(err instanceof Error ? err.message : String(err));
-          }
-        })
-        .finally(() => {
-          if (!cancelled) {
-            setSearching(false);
-          }
-        });
+      void runSearch();
     }, 250);
 
     return () => {
@@ -2991,7 +3015,7 @@ function App() {
                   aria-label={`${session.displayName}, ${session.providerDisplayName}`}
                   onClick={() => setSelectedSessionKey(currentSessionKey)}
                   onFocus={() => setSelectedSessionKey(currentSessionKey)}
-                  className="min-w-0 rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-violet-300 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-50 dark:focus-visible:ring-violet-500 dark:focus-visible:ring-offset-slate-950"
+                  className="session-card-shell min-w-0 rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-violet-300 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-50 dark:focus-visible:ring-violet-500 dark:focus-visible:ring-offset-slate-950"
                 >
                   <Card
                     className={cn(

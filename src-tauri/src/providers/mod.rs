@@ -4,15 +4,41 @@ mod codex;
 use crate::models::ProviderStatus;
 use crate::terminal;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const PREVIEW_LINE_LIMIT: usize = 3;
 const PREVIEW_CHAR_LIMIT: usize = 420;
 const SEARCH_LINE_CHAR_LIMIT: usize = 260;
+const SESSION_CARD_CACHE_LIMIT: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    length: u64,
+    modified: SystemTime,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionCardMetadata {
+    first_user_input: Option<String>,
+    last_user_input: Option<String>,
+    last_message_preview: Option<String>,
+    last_message_role: Option<String>,
+    working_directory: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSessionCard {
+    fingerprint: FileFingerprint,
+    metadata: SessionCardMetadata,
+}
+
+static SESSION_CARD_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedSessionCard>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct ProviderSession {
@@ -373,26 +399,91 @@ fn session_card_previews(
     Option<String>,
     Option<String>,
 ) {
+    let metadata = session_card_metadata(path);
+
+    (
+        metadata.first_user_input,
+        metadata.last_user_input,
+        metadata.last_message_preview,
+        metadata.last_message_role,
+    )
+}
+
+fn session_working_directory(path: &Path) -> Option<String> {
+    session_card_metadata(path).working_directory
+}
+
+fn session_card_metadata(path: &Path) -> SessionCardMetadata {
+    let fingerprint = file_fingerprint(path);
+    let cache = SESSION_CARD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(fingerprint) = fingerprint.as_ref() {
+        if let Ok(cache) = cache.lock() {
+            if let Some(cached) = cache.get(path) {
+                if &cached.fingerprint == fingerprint {
+                    return cached.metadata.clone();
+                }
+            }
+        }
+    }
+
+    let metadata = read_session_card_metadata(path);
+
+    if let Some(fingerprint) = fingerprint {
+        if let Ok(mut cache) = cache.lock() {
+            if cache.len() >= SESSION_CARD_CACHE_LIMIT && !cache.contains_key(path) {
+                let remove_count = (SESSION_CARD_CACHE_LIMIT / 4).max(1);
+                let expired_paths = cache.keys().take(remove_count).cloned().collect::<Vec<_>>();
+
+                for expired_path in expired_paths {
+                    cache.remove(&expired_path);
+                }
+            }
+
+            cache.insert(
+                path.to_path_buf(),
+                CachedSessionCard {
+                    fingerprint,
+                    metadata: metadata.clone(),
+                },
+            );
+        }
+    }
+
+    metadata
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+
+    Some(FileFingerprint {
+        length: metadata.len(),
+        modified: metadata.modified().ok()?,
+    })
+}
+
+fn read_session_card_metadata(path: &Path) -> SessionCardMetadata {
     let Ok(file) = File::open(path) else {
-        return (None, None, None, None);
+        return SessionCardMetadata::default();
     };
 
-    let mut first_user_input = None;
-    let mut last_user_input = None;
-    let mut last_message_preview = None;
-    let mut last_message_role = None;
+    let mut metadata = SessionCardMetadata::default();
 
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
 
+        if metadata.working_directory.is_none() {
+            metadata.working_directory = extract_working_directory(&value);
+        }
+
         if let Some(text) = extract_user_input_text(&value).and_then(|text| format_preview(&text)) {
-            if first_user_input.is_none() {
-                first_user_input = Some(text.clone());
+            if metadata.first_user_input.is_none() {
+                metadata.first_user_input = Some(text.clone());
             }
 
-            last_user_input = Some(text);
+            metadata.last_user_input = Some(text);
         }
 
         for message in extract_chat_messages(&value) {
@@ -400,35 +491,12 @@ fn session_card_previews(
                 continue;
             };
 
-            last_message_preview = Some(preview);
-            last_message_role = Some(message.role);
+            metadata.last_message_preview = Some(preview);
+            metadata.last_message_role = Some(message.role);
         }
     }
 
-    (
-        first_user_input,
-        last_user_input,
-        last_message_preview,
-        last_message_role,
-    )
-}
-
-fn session_working_directory(path: &Path) -> Option<String> {
-    let Ok(file) = File::open(path) else {
-        return None;
-    };
-
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-
-        if let Some(working_directory) = extract_working_directory(&value) {
-            return Some(working_directory);
-        }
-    }
-
-    None
+    metadata
 }
 
 fn extract_working_directory(value: &Value) -> Option<String> {
@@ -982,6 +1050,40 @@ mod tests {
                 Some("The release checklist is ready for review.".to_string()),
                 Some("assistant".to_string()),
             )
+        );
+    }
+
+    #[test]
+    fn session_card_cache_refreshes_changed_files() {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sessiondex-cache-test-{}-{unique_suffix}.jsonl",
+            std::process::id()
+        ));
+        let first_line = json!({
+            "type": "user_message",
+            "message": "first cached preview"
+        });
+        let second_line = json!({
+            "type": "user_message",
+            "message": "updated cached preview with a different length"
+        });
+
+        fs::write(&path, format!("{first_line}\n")).expect("test jsonl file should be writable");
+        let first_preview = session_card_previews(&path);
+
+        fs::write(&path, format!("{second_line}\n")).expect("test jsonl file should be writable");
+        let updated_preview = session_card_previews(&path);
+
+        let _ = fs::remove_file(path);
+
+        assert_eq!(first_preview.0, Some("first cached preview".to_string()));
+        assert_eq!(
+            updated_preview.0,
+            Some("updated cached preview with a different length".to_string())
         );
     }
 

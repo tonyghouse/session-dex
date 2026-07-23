@@ -346,9 +346,11 @@ Android, iOS, and Windows Store icon outputs are intentionally not kept in this 
 
 Open SessionDex after installing it.
 
+SessionDex runs as one foreground GUI process per signed-in user. Launching it again focuses the existing window, and closing the window exits the process completely. SessionDex does not use folder-based launch arguments, so commands such as `sessiondex .` or `session-dex .` are not part of its workflow.
+
 The dashboard shows detected sessions from supported providers. Provider connection status is available in Settings under Detected AI CLIs.
 
-SessionDex reads provider session files directly when the app loads and when you click Refresh. It does not copy provider sessions into its own database.
+SessionDex reads provider session files directly when the app loads and when you click Refresh. Unchanged session-card metadata is cached only in process memory to keep refreshes lightweight. It does not copy provider sessions into its own database.
 
 Resume opens the selected session in Terminal on macOS, an auto-detected terminal emulator on Linux, and Windows Terminal, PowerShell, or Command Prompt on Windows.
 

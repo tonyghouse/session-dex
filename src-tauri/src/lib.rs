@@ -1,9 +1,11 @@
 mod db;
+mod instance;
 mod models;
 mod providers;
 mod terminal;
 
 use db::{Database, SessionDiscovery};
+use instance::{InstanceClaim, InstanceMessage, InstanceOwner};
 use models::{
     AppSettings, DeleteResult, ProviderStatus, SessionHistory, SessionMessage, SessionRecord,
     SessionSearchResult, UninstallResult,
@@ -16,7 +18,7 @@ use std::{
     thread,
     time::Duration,
 };
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 const FRIENDLY_NAME_MAX_CHARS: usize = 100;
 const COLLECTION_NAME_MAX_CHARS: usize = 48;
@@ -34,17 +36,23 @@ struct GitSnapshot {
 }
 
 #[tauri::command]
-fn list_sessions(state: tauri::State<'_, AppState>) -> Result<Vec<SessionRecord>, String> {
-    let friendly_names = state.db.friendly_names()?;
-    let hidden_sessions = state.db.hidden_sessions()?;
-    let pinned_sessions = state.db.pinned_sessions()?;
-    let recent_resumes = state.db.recent_resumes()?;
-    let favorite_projects = state.db.favorite_projects()?;
-    let mut session_discoveries = state.db.session_discoveries()?;
-    let session_collections = state.db.session_collections()?;
-    let collection_colors = state.db.collection_colors()?;
-    let session_notes = state.db.session_notes()?;
-    let session_tags = state.db.session_tags()?;
+async fn list_sessions(app: tauri::AppHandle) -> Result<Vec<SessionRecord>, String> {
+    let db = app.state::<AppState>().db.clone();
+
+    run_blocking(app, "list_sessions", move || list_sessions_inner(&db)).await
+}
+
+fn list_sessions_inner(db: &Database) -> Result<Vec<SessionRecord>, String> {
+    let friendly_names = db.friendly_names()?;
+    let hidden_sessions = db.hidden_sessions()?;
+    let pinned_sessions = db.pinned_sessions()?;
+    let recent_resumes = db.recent_resumes()?;
+    let favorite_projects = db.favorite_projects()?;
+    let mut session_discoveries = db.session_discoveries()?;
+    let session_collections = db.session_collections()?;
+    let collection_colors = db.collection_colors()?;
+    let session_notes = db.session_notes()?;
+    let session_tags = db.session_tags()?;
     let mut git_snapshots = HashMap::new();
     let mut records = Vec::new();
 
@@ -64,7 +72,7 @@ fn list_sessions(state: tauri::State<'_, AppState>) -> Result<Vec<SessionRecord>
                 .filter(|working_directory| !working_directory.is_empty())
                 .is_some_and(|working_directory| favorite_projects.contains(working_directory));
             let discovery = session_discovery(
-                &state.db,
+                db,
                 &mut session_discoveries,
                 &mut git_snapshots,
                 &key,
@@ -236,14 +244,36 @@ fn normalized_path(path: &str) -> Option<String> {
     }
 }
 
+async fn run_blocking<T, F>(
+    app: tauri::AppHandle,
+    operation: &'static str,
+    task: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(task).await {
+        Ok(result) => result,
+        Err(error) => {
+            let message = format!("SessionDex {operation} worker failed: {error}");
+            eprintln!("{message}");
+            app.exit(1);
+            Err(message)
+        }
+    }
+}
+
 #[tauri::command]
 async fn search_sessions(
+    app: tauri::AppHandle,
     query: String,
     provider_filter: Option<String>,
 ) -> Result<Vec<SessionSearchResult>, String> {
-    tauri::async_runtime::spawn_blocking(move || search_sessions_inner(query, provider_filter))
-        .await
-        .map_err(|err| err.to_string())?
+    run_blocking(app, "search_sessions", move || {
+        search_sessions_inner(query, provider_filter)
+    })
+    .await
 }
 
 fn search_sessions_inner(
@@ -284,10 +314,11 @@ fn search_sessions_inner(
 
 #[tauri::command]
 async fn get_session_history(
+    app: tauri::AppHandle,
     provider: String,
     session_id: String,
 ) -> Result<SessionHistory, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    run_blocking(app, "get_session_history", move || {
         let provider_impl = providers::by_id(&provider)
             .ok_or_else(|| format!("Unsupported provider: {provider}"))?;
         let history = provider_impl.session_history(&session_id)?;
@@ -307,17 +338,22 @@ async fn get_session_history(
         })
     })
     .await
-    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn list_providers() -> Vec<ProviderStatus> {
-    providers::statuses()
+async fn list_providers(app: tauri::AppHandle) -> Result<Vec<ProviderStatus>, String> {
+    run_blocking(app, "list_providers", || Ok(providers::statuses())).await
 }
 
 #[tauri::command]
-fn list_repository_branches(repository_path: String) -> Vec<String> {
-    git_branch_options(&repository_path)
+async fn list_repository_branches(
+    app: tauri::AppHandle,
+    repository_path: String,
+) -> Result<Vec<String>, String> {
+    run_blocking(app, "list_repository_branches", move || {
+        Ok(git_branch_options(&repository_path))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -480,7 +516,7 @@ fn uninstall_app(
     state.db.reset_local_data()?;
 
     if let Ok(data_dir) = app.path().app_data_dir() {
-        remove_dir_if_exists(data_dir)?;
+        remove_database_files(data_dir)?;
     }
 
     if let Ok(cache_dir) = app.path().app_cache_dir() {
@@ -514,44 +550,52 @@ fn uninstall_app(
 }
 
 #[tauri::command]
-fn resume_session(
-    state: tauri::State<'_, AppState>,
+async fn resume_session(
+    app: tauri::AppHandle,
     provider: String,
     session_id: String,
     working_directory: Option<String>,
 ) -> Result<(), String> {
-    let provider_impl =
-        providers::by_id(&provider).ok_or_else(|| format!("Unsupported provider: {provider}"))?;
-    let settings = state.db.get_settings()?;
-    let command = provider_impl.resume_command(&session_id, working_directory.as_deref());
+    let db = app.state::<AppState>().db.clone();
 
-    terminal::launch(&settings, &command)?;
-    state.db.record_session_resumed(&provider, &session_id)?;
+    run_blocking(app, "resume_session", move || {
+        let provider_impl = providers::by_id(&provider)
+            .ok_or_else(|| format!("Unsupported provider: {provider}"))?;
+        let settings = db.get_settings()?;
+        let command = provider_impl.resume_command(&session_id, working_directory.as_deref());
 
-    Ok(())
+        terminal::launch(&settings, &command)?;
+        db.record_session_resumed(&provider, &session_id)?;
+
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn open_working_directory(path: String) -> Result<(), String> {
-    let path = PathBuf::from(path.trim());
+async fn open_working_directory(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    run_blocking(app, "open_working_directory", move || {
+        let path = PathBuf::from(path.trim());
 
-    if !path.is_absolute() {
-        return Err("Project folder path must be absolute.".to_string());
-    }
+        if !path.is_absolute() {
+            return Err("Project folder path must be absolute.".to_string());
+        }
 
-    if !path.is_dir() {
-        return Err(format!("Project folder does not exist: {}", path.display()));
-    }
+        if !path.is_dir() {
+            return Err(format!("Project folder does not exist: {}", path.display()));
+        }
 
-    let status = open_path_command(&path)
-        .status()
-        .map_err(|err| format!("Failed to open {}: {err}", path.display()))?;
+        let status = open_path_command(&path)
+            .status()
+            .map_err(|err| format!("Failed to open {}: {err}", path.display()))?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Failed to open {}", path.display()))
-    }
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("Failed to open {}", path.display()))
+        }
+    })
+    .await
 }
 
 #[cfg(target_os = "macos")]
@@ -672,9 +716,65 @@ fn validate_branch_name(branch_name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn focus_main_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "The SessionDex main window is unavailable.".to_string())?;
+
+    if window.is_minimized().map_err(|error| error.to_string())? {
+        window.unminimize().map_err(|error| error.to_string())?;
+    }
+
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())
+}
+
+fn start_instance_dispatcher(app: tauri::AppHandle, owner: InstanceOwner) -> Result<(), String> {
+    let InstanceOwner { guard, receiver } = owner;
+
+    thread::Builder::new()
+        .name("sessiondex-instance-dispatch".to_string())
+        .spawn(move || {
+            let _guard = guard;
+
+            loop {
+                match receiver.recv() {
+                    Ok(InstanceMessage::Launch) => {
+                        if let Err(error) = focus_main_window(&app) {
+                            eprintln!("SessionDex relaunch failed: {error}");
+                            app.exit(1);
+                            return;
+                        }
+                    }
+                    Ok(InstanceMessage::Fatal(error)) => {
+                        eprintln!("{error}");
+                        app.exit(1);
+                        return;
+                    }
+                    Err(error) => {
+                        eprintln!("SessionDex instance coordination stopped: {error}");
+                        app.exit(1);
+                        return;
+                    }
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| format!("Failed to start SessionDex instance coordination: {error}"))
+}
+
 pub fn run() {
-    tauri::Builder::default()
-        .setup(|app| {
+    let instance_owner = match instance::claim_or_forward() {
+        Ok(InstanceClaim::Primary(owner)) => owner,
+        Ok(InstanceClaim::Forwarded) => return,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
+
+    let application = tauri::Builder::default()
+        .setup(move |app| {
             let db_path = app
                 .path()
                 .app_data_dir()
@@ -685,6 +785,8 @@ pub fn run() {
                 .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
 
             app.manage(AppState { db });
+            start_instance_dispatcher(app.handle().clone(), instance_owner)
+                .map_err(std::io::Error::other)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -710,8 +812,17 @@ pub fn run() {
             resume_session,
             open_working_directory
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running SessionDex");
+        .on_window_event(|window, event| {
+            if window.label() == "main" && matches!(event, WindowEvent::Destroyed) {
+                window.app_handle().exit(0);
+            }
+        })
+        .run(tauri::generate_context!());
+
+    if let Err(error) = application {
+        eprintln!("SessionDex stopped: {error}");
+        std::process::exit(1);
+    }
 }
 
 fn remove_dir_if_exists(path: PathBuf) -> Result<(), String> {
@@ -720,6 +831,24 @@ fn remove_dir_if_exists(path: PathBuf) -> Result<(), String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(format!("Failed to remove {}: {err}", path.display())),
     }
+}
+
+fn remove_database_files(data_dir: PathBuf) -> Result<(), String> {
+    for file_name in [
+        "sessiondex.sqlite3",
+        "sessiondex.sqlite3-shm",
+        "sessiondex.sqlite3-wal",
+    ] {
+        let path = data_dir.join(file_name);
+
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Failed to remove {}: {error}", path.display())),
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

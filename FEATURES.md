@@ -283,8 +283,11 @@ SessionDex keeps session data current while staying explicit about user actions.
 What this provides:
 
 - Manual refresh from the header or keyboard.
-- Automatic refresh every 12 seconds while the app window is visible and focused.
+- Automatic refresh every 30 seconds while the app window is visible and focused.
 - Background refresh avoids overlapping refresh work.
+- Unchanged session files reuse lightweight in-memory card metadata instead of reparsing their histories.
+- Chat-history searches are serialized so rapid typing cannot start overlapping full-history scans.
+- Off-screen session cards defer browser layout and paint work until they approach the viewport.
 - Success and error messages for resume, rename, collection, note, tag, hide, unhide, copy, and folder actions.
 - Toasts for copied resume commands and session IDs.
 - Statistics popover with total sessions, provider counts, pinned sessions, hidden sessions, collection count, and tag count.
@@ -292,6 +295,8 @@ What this provides:
 Why it matters:
 
 AI CLI sessions can be created outside SessionDex. Refresh and status feedback keep the dashboard trustworthy without hiding failures.
+
+SessionDex keeps one foreground GUI process per signed-in user. Launching it again focuses the existing window, and closing the main window exits the process. It does not use repository or folder launch arguments such as `sessiondex .`.
 
 ## 13. Settings
 

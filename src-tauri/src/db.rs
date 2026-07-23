@@ -3,7 +3,7 @@ use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct Database {
@@ -28,6 +28,13 @@ impl Database {
         }
 
         let conn = self.connection()?;
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            "#,
+        )
+        .map_err(|err| err.to_string())?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS friendly_names (
@@ -816,7 +823,11 @@ impl Database {
     }
 
     fn connection(&self) -> Result<Connection, String> {
-        Connection::open(&self.path).map_err(|err| err.to_string())
+        let connection = Connection::open(&self.path).map_err(|err| err.to_string())?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|err| err.to_string())?;
+        Ok(connection)
     }
 }
 

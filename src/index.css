@@ -71,3 +71,8 @@ input {
 .dark .sessiondex-scrollbar::-webkit-scrollbar-thumb:hover {
   background-color: #64748b;
 }
+
+.session-card-shell {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 32rem;
+}

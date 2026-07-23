@@ -2,9 +2,13 @@ use crate::models::AppSettings;
 use crate::providers::ResumeCommand;
 #[cfg(target_os = "windows")]
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
-#[cfg(target_os = "windows")]
 pub fn command_available(program: &str) -> bool {
     let program = program.trim();
 
@@ -12,25 +16,56 @@ pub fn command_available(program: &str) -> bool {
         return false;
     }
 
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
+    const CACHE_DURATION: Duration = Duration::from_secs(30);
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut cache) = cache.lock() else {
+        return command_available_uncached(program);
+    };
+
+    if let Some((checked_at, available)) = cache.get(program) {
+        if checked_at.elapsed() < CACHE_DURATION {
+            return *available;
+        }
+    }
+
+    let available = command_available_uncached(program);
+    cache.insert(program.to_string(), (Instant::now(), available));
+    available
+}
+
+#[cfg(target_os = "windows")]
+fn command_available_uncached(program: &str) -> bool {
     if program.contains('\\') || program.contains('/') {
         return Path::new(program).is_file();
     }
 
     Command::new("where.exe")
         .arg(program)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn command_available(program: &str) -> bool {
+fn command_available_uncached(program: &str) -> bool {
     let check = format!("command -v {}", shell_escape(program));
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
 
     Command::new(&shell)
         .args(["-lc", &check])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
-        .or_else(|_| Command::new("/bin/sh").args(["-lc", &check]).status())
+        .or_else(|_| {
+            Command::new("/bin/sh")
+                .args(["-lc", &check])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        })
         .is_ok_and(|status| status.success())
 }
 
