@@ -1,7 +1,5 @@
 #[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(target_os = "linux")]
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -127,15 +125,17 @@ fn graphics_capability() -> GraphicsCapability {
     }
 
     match fs::read_dir("/dev/dri") {
-        Ok(entries)
+        Ok(entries) => {
             if entries
                 .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().starts_with("renderD")) =>
-        {
-            GraphicsCapability::Hardware
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+            {
+                GraphicsCapability::Hardware
+            } else {
+                GraphicsCapability::Unknown
+            }
         }
-        Ok(_) if Path::new("/dev/dri").exists() => GraphicsCapability::Unknown,
-        _ => GraphicsCapability::Software,
+        Err(_) => GraphicsCapability::Software,
     }
 }
 
