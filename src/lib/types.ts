@@ -29,12 +29,39 @@ export interface SessionRecord {
   discoveredAt: number | null;
   resumeCommand: string;
   lastModified: number | null;
+  sourceVersion: string;
   lastResumed: number | null;
   canDelete: boolean;
   canResume: boolean;
   isHidden: boolean;
   isPinned: boolean;
   isFavoriteProject: boolean;
+}
+
+export interface SessionCardDetails {
+  provider: string;
+  sessionId: string;
+  sourceVersion: string;
+  firstUserInput: string | null;
+  lastUserInput: string | null;
+  lastMessagePreview: string | null;
+  lastMessageRole: string | null;
+  workingDirectory: string | null;
+  discoveredRepository: string | null;
+  discoveredBranch: string | null;
+  discoveredAt: number | null;
+  resumeCommand: string;
+  isFavoriteProject: boolean;
+}
+
+export interface SessionIdentity {
+  provider: string;
+  sessionId: string;
+}
+
+export interface SessionRefresh {
+  upserted: SessionRecord[];
+  removed: SessionIdentity[];
 }
 
 export interface SessionSearchResult {

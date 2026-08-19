@@ -23,12 +23,52 @@ pub struct SessionRecord {
     pub discovered_at: Option<i64>,
     pub resume_command: String,
     pub last_modified: Option<i64>,
+    pub source_version: String,
     pub last_resumed: Option<i64>,
     pub can_delete: bool,
     pub can_resume: bool,
     pub is_hidden: bool,
     pub is_pinned: bool,
     pub is_favorite_project: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCardRequest {
+    pub provider: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCardDetails {
+    pub provider: String,
+    pub session_id: String,
+    pub source_version: String,
+    pub first_user_input: Option<String>,
+    pub last_user_input: Option<String>,
+    pub last_message_preview: Option<String>,
+    pub last_message_role: Option<String>,
+    pub working_directory: Option<String>,
+    pub discovered_repository: Option<String>,
+    pub discovered_branch: Option<String>,
+    pub discovered_at: Option<i64>,
+    pub resume_command: String,
+    pub is_favorite_project: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIdentity {
+    pub provider: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRefresh {
+    pub upserted: Vec<SessionRecord>,
+    pub removed: Vec<SessionIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize)]

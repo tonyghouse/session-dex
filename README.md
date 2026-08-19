@@ -341,6 +341,7 @@ SessionDex-owned data includes:
 - notes
 - tags
 - settings
+- a derived provider-session index containing IDs, source paths, file fingerprints, active/archive state, and cached working directories; it contains no transcript text
 
 Provider-owned data stays with the original CLI tool.
 
@@ -364,7 +365,11 @@ SessionDex runs as one foreground GUI process per signed-in user. Launching it a
 
 The dashboard shows detected sessions from supported providers. Provider connection status is available in Settings under Detected AI CLIs.
 
-SessionDex reads provider session files directly when the app loads and when you click Refresh. Unchanged session-card metadata is cached only in process memory to keep refreshes lightweight. It does not copy provider sessions into its own database.
+SessionDex renders its lightweight SQLite session index first, then reconciles it against provider directories at every startup, on manual Refresh, and every five minutes while the window is active. Reconciliation uses directory watermarks, a ten-minute last-scan overlap, and a bounded rolling audit instead of a continuously running filesystem watcher. Confirmed external deletions remove only the matching SessionDex session metadata after a successful provider scan; incomplete scans never trigger provider-wide cleanup.
+
+Scheduled reconciliations send only changed and removed session records back to the dashboard rather than retransmitting the entire indexed collection.
+
+The persistent index contains provider/session IDs, source paths, file fingerprints, active/archive state, and cached working directories, but no transcript text. Card previews remain in process memory and are parsed lazily for the first 60 rendered cards, with additional cards loaded explicitly in groups of 60.
 
 Resume opens the selected session in Terminal on macOS, an auto-detected terminal emulator on Linux, and Windows Terminal, PowerShell, or Command Prompt on Windows.
 

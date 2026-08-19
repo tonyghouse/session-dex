@@ -1,8 +1,9 @@
 use super::{
-    chat_history_match, collect_jsonl_files, home_dir, modified_seconds, read_session_history,
-    session_card_previews, session_working_directory, sort_recent_first, ProviderCapabilities,
-    ProviderDescriptor, ProviderRegistration, ProviderSession, ProviderSessionHistory,
-    ProviderSessionSearchMatch, ResumeCommand, SessionProvider,
+    chat_history_match, collect_jsonl_files, collect_session_directories, home_dir,
+    read_session_history, session_sources_in_directory, ProviderCapabilities, ProviderDescriptor,
+    ProviderDirectoryInventory, ProviderRegistration, ProviderSessionDirectory,
+    ProviderSessionHistory, ProviderSessionSearchMatch, ProviderSessionSource, ResumeCommand,
+    SessionProvider,
 };
 use std::path::{Path, PathBuf};
 
@@ -32,44 +33,6 @@ impl SessionProvider for ClaudeProvider {
 
     fn sessions_root(&self) -> Option<PathBuf> {
         Some(home_dir()?.join(".claude").join("projects"))
-    }
-
-    fn list_sessions(&self) -> Result<Vec<ProviderSession>, String> {
-        let Some(root) = self.sessions_root() else {
-            return Ok(Vec::new());
-        };
-
-        if !root.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut sessions = collect_jsonl_files(&root, 3)
-            .into_iter()
-            .filter_map(|path| {
-                let session_id = path.file_stem()?.to_string_lossy().to_string();
-                let project = path
-                    .parent()
-                    .and_then(|parent| parent.file_name())
-                    .map(|name| name.to_string_lossy().to_string());
-                let (first_user_input, last_user_input, last_message_preview, last_message_role) =
-                    session_card_previews(&path);
-                let working_directory = session_working_directory(&path);
-
-                Some(ProviderSession {
-                    session_id,
-                    title: project.map(|project| format!("Claude session in {project}")),
-                    first_user_input,
-                    last_user_input,
-                    last_message_preview,
-                    last_message_role,
-                    working_directory,
-                    last_modified: modified_seconds(&path),
-                })
-            })
-            .collect::<Vec<_>>();
-
-        sort_recent_first(&mut sessions);
-        Ok(sessions)
     }
 
     fn search_sessions(&self, query: &str) -> Result<Vec<ProviderSessionSearchMatch>, String> {
@@ -108,6 +71,35 @@ impl SessionProvider for ClaudeProvider {
             args: vec!["--resume".to_string(), session_id.to_string()],
             working_directory: working_directory.map(str::to_string),
         }
+    }
+
+    fn session_directories(
+        &self,
+        known_directories: &[ProviderSessionDirectory],
+    ) -> ProviderDirectoryInventory {
+        let Some(root) = self.sessions_root() else {
+            return ProviderDirectoryInventory {
+                directories: Vec::new(),
+                complete: true,
+            };
+        };
+
+        collect_session_directories(&[(root, true)], 3, known_directories)
+    }
+
+    fn sessions_in_directory(
+        &self,
+        directory: &ProviderSessionDirectory,
+    ) -> Result<Vec<ProviderSessionSource>, String> {
+        session_sources_in_directory(directory, |path| {
+            let session_id = path.file_stem()?.to_string_lossy().to_string();
+            let project = path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .map(|name| name.to_string_lossy().to_string());
+            let title = project.map(|project| format!("Claude session in {project}"));
+            Some((session_id, title))
+        })
     }
 }
 

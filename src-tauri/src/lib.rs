@@ -4,10 +4,14 @@ mod models;
 mod providers;
 mod terminal;
 
-use db::{Database, SessionDiscovery};
+use db::{
+    Database, IndexedDirectoryScan, IndexedSession, IndexedSessionDirectory, SessionDiscovery,
+    SessionMetadataSnapshot,
+};
 use instance::{InstanceClaim, InstanceMessage, InstanceOwner};
 use models::{
-    AppSettings, DeleteResult, ProviderStatus, SessionHistory, SessionMessage, SessionRecord,
+    AppSettings, DeleteResult, ProviderStatus, SessionCardDetails, SessionCardRequest,
+    SessionHistory, SessionIdentity, SessionMessage, SessionRecord, SessionRefresh,
     SessionSearchResult, UninstallResult,
 };
 use std::collections::{HashMap, HashSet};
@@ -16,13 +20,16 @@ use std::{
     fs,
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Manager, WindowEvent};
 
 const FRIENDLY_NAME_MAX_CHARS: usize = 100;
 const COLLECTION_NAME_MAX_CHARS: usize = 48;
 const TAG_NAME_MAX_CHARS: usize = 32;
+const SESSION_SCAN_BUFFER_SECONDS: i64 = 10 * 60;
+const SESSION_DIRECTORY_AUDIT_BATCH: usize = 32;
+const TARGETED_SESSION_METADATA_LIMIT: usize = 512;
 
 #[derive(Clone)]
 struct AppState {
@@ -42,92 +49,422 @@ async fn list_sessions(app: tauri::AppHandle) -> Result<Vec<SessionRecord>, Stri
     run_blocking(app, "list_sessions", move || list_sessions_inner(&db)).await
 }
 
+#[tauri::command]
+async fn refresh_sessions(app: tauri::AppHandle) -> Result<SessionRefresh, String> {
+    let db = app.state::<AppState>().db.clone();
+
+    run_blocking(app, "refresh_sessions", move || {
+        let changed_sessions = reconcile_session_index(&db)?;
+        let changed_keys = changed_sessions.iter().cloned().collect::<Vec<_>>();
+        let indexed_sessions = db.indexed_sessions_for_keys(&changed_keys)?;
+        let active_keys = indexed_sessions
+            .iter()
+            .map(|session| (session.provider.clone(), session.session_id.clone()))
+            .collect::<HashSet<_>>();
+        let upserted = build_session_records(&db, indexed_sessions)?;
+        let removed = changed_sessions
+            .into_iter()
+            .filter(|key| !active_keys.contains(key))
+            .map(|(provider, session_id)| SessionIdentity {
+                provider,
+                session_id,
+            })
+            .collect();
+
+        Ok(SessionRefresh { upserted, removed })
+    })
+    .await
+}
+
 fn list_sessions_inner(db: &Database) -> Result<Vec<SessionRecord>, String> {
-    let friendly_names = db.friendly_names()?;
-    let hidden_sessions = db.hidden_sessions()?;
-    let pinned_sessions = db.pinned_sessions()?;
-    let recent_resumes = db.recent_resumes()?;
-    let favorite_projects = db.favorite_projects()?;
-    let mut session_discoveries = db.session_discoveries()?;
-    let session_collections = db.session_collections()?;
-    let collection_colors = db.collection_colors()?;
-    let session_notes = db.session_notes()?;
-    let session_tags = db.session_tags()?;
+    build_session_records(db, db.indexed_active_sessions()?)
+}
+
+fn build_session_records(
+    db: &Database,
+    indexed_sessions: Vec<IndexedSession>,
+) -> Result<Vec<SessionRecord>, String> {
+    let metadata = if indexed_sessions.len() <= TARGETED_SESSION_METADATA_LIMIT {
+        let keys = indexed_sessions
+            .iter()
+            .map(|session| (session.provider.clone(), session.session_id.clone()))
+            .collect::<Vec<_>>();
+        db.session_metadata_for_keys(&keys)?
+    } else {
+        db.all_session_metadata()?
+    };
+    let SessionMetadataSnapshot {
+        friendly_names,
+        hidden_sessions,
+        pinned_sessions,
+        recent_resumes,
+        favorite_projects,
+        mut session_discoveries,
+        session_collections,
+        collection_colors,
+        session_notes,
+        session_tags,
+    } = metadata;
     let mut git_snapshots = HashMap::new();
     let mut records = Vec::new();
+    let provider_instances = providers::all()
+        .into_iter()
+        .map(|provider| (provider.id().to_string(), provider))
+        .collect::<HashMap<_, _>>();
+    let provider_capabilities = provider_instances
+        .iter()
+        .map(|(provider_id, provider)| {
+            (
+                provider_id.clone(),
+                (
+                    terminal::command_available(provider.executable()),
+                    provider.supports_delete(),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
 
-    for provider in providers::all() {
-        let provider_available = terminal::command_available(provider.executable());
-        let can_delete = provider.supports_delete();
-
-        for session in provider.list_sessions()? {
-            let key = (provider.id().to_string(), session.session_id.clone());
-            let is_hidden = hidden_sessions.contains(&key);
-            let is_pinned = pinned_sessions.contains(&key);
-            let last_resumed = recent_resumes.get(&key).copied();
-            let working_directory = session.working_directory;
-            let is_favorite_project = working_directory
-                .as_deref()
-                .map(str::trim)
-                .filter(|working_directory| !working_directory.is_empty())
-                .is_some_and(|working_directory| favorite_projects.contains(working_directory));
-            let discovery = session_discovery(
+    for session in indexed_sessions {
+        let Some(provider) = provider_instances.get(&session.provider) else {
+            continue;
+        };
+        let (provider_available, can_delete) = provider_capabilities
+            .get(&session.provider)
+            .copied()
+            .unwrap_or_default();
+        let source_path = Path::new(&session.source_path);
+        let cached_card = providers::cached_session_card(
+            source_path,
+            session.source_size,
+            session.source_modified_ns,
+        );
+        let working_directory = cached_card
+            .as_ref()
+            .and_then(|card| card.working_directory.clone())
+            .or(session.working_directory);
+        let key = (session.provider.clone(), session.session_id.clone());
+        let is_hidden = hidden_sessions.contains(&key);
+        let is_pinned = pinned_sessions.contains(&key);
+        let last_resumed = recent_resumes.get(&key).copied();
+        let is_favorite_project = working_directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|working_directory| !working_directory.is_empty())
+            .is_some_and(|working_directory| favorite_projects.contains(working_directory));
+        let discovery = if working_directory.is_some() {
+            Some(session_discovery(
                 db,
                 &mut session_discoveries,
                 &mut git_snapshots,
                 &key,
                 working_directory.as_deref(),
-            )?;
+            )?)
+        } else {
+            session_discoveries.get(&key).cloned()
+        };
 
-            let friendly_name = friendly_names.get(&key).cloned();
-            let collection = session_collections.get(&key).cloned();
-            let collection_color = collection
-                .as_deref()
-                .and_then(|collection_name| collection_colors.get(collection_name))
-                .cloned();
-            let note = session_notes.get(&key).cloned();
-            let tags = session_tags.get(&key).cloned().unwrap_or_default();
-            let display_name = friendly_name
-                .clone()
-                .or_else(|| session.title.clone())
-                .unwrap_or_else(|| session.session_id.clone());
-            let resume_command = terminal::shell_command(
-                &provider.resume_command(&session.session_id, working_directory.as_deref()),
-            );
+        let friendly_name = friendly_names.get(&key).cloned();
+        let collection = session_collections.get(&key).cloned();
+        let collection_color = collection
+            .as_deref()
+            .and_then(|collection_name| collection_colors.get(collection_name))
+            .cloned();
+        let note = session_notes.get(&key).cloned();
+        let tags = session_tags.get(&key).cloned().unwrap_or_default();
+        let display_name = friendly_name
+            .clone()
+            .or_else(|| session.title.clone())
+            .unwrap_or_else(|| session.session_id.clone());
+        let resume_command = terminal::shell_command(
+            &provider.resume_command(&session.session_id, working_directory.as_deref()),
+        );
+        let source_version = format!("{}:{}", session.source_size, session.source_modified_ns);
 
-            records.push(SessionRecord {
-                provider: provider.id().to_string(),
-                provider_display_name: provider.display_name().to_string(),
-                session_id: session.session_id,
-                title: session.title,
-                friendly_name,
-                collection,
-                collection_color,
-                note,
-                tags,
-                display_name,
-                first_user_input: session.first_user_input,
-                last_user_input: session.last_user_input,
-                last_message_preview: session.last_message_preview,
-                last_message_role: session.last_message_role,
-                working_directory,
-                discovered_repository: discovery.repository_path,
-                discovered_branch: discovery.branch_name,
-                discovered_at: Some(discovery.discovered_at),
-                resume_command,
-                last_modified: session.last_modified,
-                last_resumed,
-                can_delete,
-                can_resume: provider_available,
-                is_hidden,
-                is_pinned,
-                is_favorite_project,
-            });
-        }
+        records.push(SessionRecord {
+            provider: session.provider,
+            provider_display_name: provider.display_name().to_string(),
+            session_id: session.session_id,
+            title: session.title,
+            friendly_name,
+            collection,
+            collection_color,
+            note,
+            tags,
+            display_name,
+            first_user_input: cached_card
+                .as_ref()
+                .and_then(|card| card.first_user_input.clone()),
+            last_user_input: cached_card
+                .as_ref()
+                .and_then(|card| card.last_user_input.clone()),
+            last_message_preview: cached_card
+                .as_ref()
+                .and_then(|card| card.last_message_preview.clone()),
+            last_message_role: cached_card
+                .as_ref()
+                .and_then(|card| card.last_message_role.clone()),
+            working_directory,
+            discovered_repository: discovery
+                .as_ref()
+                .and_then(|discovery| discovery.repository_path.clone()),
+            discovered_branch: discovery
+                .as_ref()
+                .and_then(|discovery| discovery.branch_name.clone()),
+            discovered_at: discovery.map(|discovery| discovery.discovered_at),
+            resume_command,
+            last_modified: session.last_modified,
+            source_version,
+            last_resumed,
+            can_delete,
+            can_resume: provider_available,
+            is_hidden,
+            is_pinned,
+            is_favorite_project,
+        });
     }
 
     records.sort_by(|left, right| right.last_modified.cmp(&left.last_modified));
     Ok(records)
+}
+
+fn reconcile_session_index(db: &Database) -> Result<HashSet<(String, String)>, String> {
+    let scanned_at = now_seconds()?;
+    let mut changed_sessions = HashSet::new();
+
+    for provider in providers::all() {
+        let provider_id = provider.id();
+        let existing_directories = db.indexed_session_directories(provider_id)?;
+        let last_successful_scan = db.provider_last_successful_scan(provider_id)?;
+        let had_successful_scan = last_successful_scan.is_some();
+        let known_directories = if last_successful_scan.is_some() {
+            existing_directories
+                .values()
+                .map(|directory| providers::ProviderSessionDirectory {
+                    path: PathBuf::from(&directory.source_directory),
+                    modified_ns: directory.source_modified_ns,
+                    is_active: directory.is_active,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let inventory = provider.session_directories(&known_directories);
+        let last_successful_scan = last_successful_scan.unwrap_or(0);
+        let buffered_cutoff = last_successful_scan.saturating_sub(SESSION_SCAN_BUFFER_SECONDS);
+        let current_directories = inventory
+            .directories
+            .iter()
+            .map(|directory| directory.path.to_string_lossy().to_string())
+            .collect::<HashSet<_>>();
+        let removed_directories = if inventory.complete {
+            existing_directories
+                .keys()
+                .filter(|directory| !current_directories.contains(*directory))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut selected_directories = Vec::new();
+        let mut audit_candidates = Vec::new();
+
+        for directory in inventory.directories {
+            let source_directory = directory.path.to_string_lossy().to_string();
+            let previous = existing_directories.get(&source_directory);
+            let directory_modified_seconds = directory.modified_ns / 1_000_000_000;
+            let changed = previous.is_none_or(|previous| {
+                previous.source_modified_ns != directory.modified_ns
+                    || previous.is_active != directory.is_active
+            });
+            let inside_buffer = directory_modified_seconds >= buffered_cutoff;
+
+            if changed || inside_buffer {
+                selected_directories.push(directory);
+            } else if previous.is_some_and(|previous| previous.has_sessions) {
+                audit_candidates.push((
+                    previous
+                        .map(|previous| previous.last_scanned_at)
+                        .unwrap_or(0),
+                    directory,
+                ));
+            }
+        }
+
+        audit_candidates.sort_by_key(|(last_scanned_at, _)| *last_scanned_at);
+        selected_directories.extend(
+            audit_candidates
+                .into_iter()
+                .take(SESSION_DIRECTORY_AUDIT_BATCH)
+                .map(|(_, directory)| directory),
+        );
+
+        let mut scans = Vec::new();
+        let mut selected_scans_complete = true;
+
+        for directory in selected_directories {
+            match provider.sessions_in_directory(&directory) {
+                Ok(sessions) => {
+                    let source_directory = directory.path.to_string_lossy().to_string();
+                    scans.push(IndexedDirectoryScan {
+                        directory: IndexedSessionDirectory {
+                            source_directory: source_directory.clone(),
+                            source_modified_ns: directory.modified_ns,
+                            is_active: directory.is_active,
+                            last_scanned_at: scanned_at,
+                            has_sessions: !sessions.is_empty(),
+                        },
+                        sessions: sessions
+                            .into_iter()
+                            .map(|session| IndexedSession {
+                                provider: provider_id.to_string(),
+                                session_id: session.session_id,
+                                title: session.title,
+                                source_directory: source_directory.clone(),
+                                source_path: session.source_path.to_string_lossy().to_string(),
+                                source_size: session.source_size,
+                                source_modified_ns: session.source_modified_ns,
+                                last_modified: session.last_modified,
+                                working_directory: None,
+                                is_active: session.is_active,
+                            })
+                            .collect(),
+                    });
+                }
+                Err(_) => selected_scans_complete = false,
+            }
+        }
+
+        // If the same provider ID appears in active and archived storage,
+        // prefer the active source regardless of directory traversal order.
+        scans.sort_by_key(|scan| scan.directory.is_active);
+
+        let successful_scan_at =
+            (inventory.complete && selected_scans_complete).then_some(scanned_at);
+        let provider_changes = db.reconcile_indexed_directories(
+            provider_id,
+            &scans,
+            &removed_directories,
+            successful_scan_at,
+            !had_successful_scan && successful_scan_at.is_some(),
+        )?;
+
+        changed_sessions.extend(
+            provider_changes
+                .into_iter()
+                .map(|session_id| (provider_id.to_string(), session_id)),
+        );
+    }
+
+    Ok(changed_sessions)
+}
+
+fn now_seconds() -> Result<i64, String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| err.to_string())?;
+    Ok(i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+}
+
+#[tauri::command]
+async fn hydrate_session_cards(
+    app: tauri::AppHandle,
+    sessions: Vec<SessionCardRequest>,
+) -> Result<Vec<SessionCardDetails>, String> {
+    if sessions.len() > 60 {
+        return Err("Session card hydration is limited to 60 sessions per request.".to_string());
+    }
+
+    let db = app.state::<AppState>().db.clone();
+
+    run_blocking(app, "hydrate_session_cards", move || {
+        let keys = sessions
+            .into_iter()
+            .map(|session| (session.provider, session.session_id))
+            .collect::<Vec<_>>();
+
+        for (provider, _) in &keys {
+            validate_provider(provider)?;
+        }
+
+        let indexed_sessions = db.indexed_sessions_for_keys(&keys)?;
+        let mut session_discoveries = db.session_discoveries()?;
+        let favorite_projects = db.favorite_projects()?;
+        let mut git_snapshots = HashMap::new();
+        let provider_instances = providers::all()
+            .into_iter()
+            .map(|provider| (provider.id().to_string(), provider))
+            .collect::<HashMap<_, _>>();
+        let mut details = Vec::new();
+
+        for session in indexed_sessions {
+            let Some(provider) = provider_instances.get(&session.provider) else {
+                continue;
+            };
+            let source_path = Path::new(&session.source_path);
+
+            if !source_path.is_file() {
+                continue;
+            }
+
+            let card = providers::load_session_card(source_path);
+            let working_directory = card
+                .working_directory
+                .clone()
+                .or(session.working_directory.clone());
+
+            if let Some(working_directory) = card.working_directory.as_deref() {
+                db.set_indexed_working_directory(
+                    &session.provider,
+                    &session.session_id,
+                    Some(working_directory),
+                )?;
+            }
+
+            let key = (session.provider.clone(), session.session_id.clone());
+            let discovery = if working_directory.is_some() {
+                Some(session_discovery(
+                    &db,
+                    &mut session_discoveries,
+                    &mut git_snapshots,
+                    &key,
+                    working_directory.as_deref(),
+                )?)
+            } else {
+                session_discoveries.get(&key).cloned()
+            };
+            let is_favorite_project = working_directory
+                .as_deref()
+                .map(str::trim)
+                .filter(|working_directory| !working_directory.is_empty())
+                .is_some_and(|working_directory| favorite_projects.contains(working_directory));
+            let resume_command = terminal::shell_command(
+                &provider.resume_command(&session.session_id, working_directory.as_deref()),
+            );
+
+            details.push(SessionCardDetails {
+                provider: session.provider,
+                session_id: session.session_id,
+                source_version: format!("{}:{}", session.source_size, session.source_modified_ns),
+                first_user_input: card.first_user_input,
+                last_user_input: card.last_user_input,
+                last_message_preview: card.last_message_preview,
+                last_message_role: card.last_message_role,
+                working_directory,
+                discovered_repository: discovery
+                    .as_ref()
+                    .and_then(|discovery| discovery.repository_path.clone()),
+                discovered_branch: discovery
+                    .as_ref()
+                    .and_then(|discovery| discovery.branch_name.clone()),
+                discovered_at: discovery.map(|discovery| discovery.discovered_at),
+                resume_command,
+                is_favorite_project,
+            });
+        }
+
+        Ok(details)
+    })
+    .await
 }
 
 fn session_discovery(
@@ -230,7 +567,7 @@ fn git_branch_options(repository_path: &str) -> Vec<String> {
         .filter(|branch| seen_branches.insert(branch.clone()))
         .collect::<Vec<_>>();
 
-    branches.sort_by(|left, right| left.to_lowercase().cmp(&right.to_lowercase()));
+    branches.sort_by_key(|branch| branch.to_lowercase());
     branches
 }
 
@@ -480,6 +817,7 @@ fn delete_or_hide_session(
 
     if settings.hard_delete_sessions && provider_impl.supports_delete() {
         provider_impl.delete_session(&session_id)?;
+        state.db.delete_indexed_session(&provider, &session_id)?;
         return Ok(DeleteResult {
             action: "deleted".to_string(),
             message: format!(
@@ -782,11 +1120,10 @@ pub fn run() {
             let db_path = app
                 .path()
                 .app_data_dir()
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?
+                .map_err(std::io::Error::other)?
                 .join("sessiondex.sqlite3");
             let db = Database::new(db_path);
-            db.init()
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+            db.init().map_err(std::io::Error::other)?;
 
             app.manage(AppState { db });
             start_instance_dispatcher(app.handle().clone(), instance_owner)
@@ -795,6 +1132,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions,
+            refresh_sessions,
+            hydrate_session_cards,
             search_sessions,
             get_session_history,
             list_providers,

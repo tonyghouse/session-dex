@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 const PREVIEW_LINE_LIMIT: usize = 3;
 const PREVIEW_CHAR_LIMIT: usize = 420;
@@ -19,8 +19,8 @@ const SESSION_CARD_CACHE_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileFingerprint {
-    length: u64,
-    modified: SystemTime,
+    length: i64,
+    modified_ns: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -41,15 +41,36 @@ struct CachedSessionCard {
 static SESSION_CARD_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedSessionCard>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
-pub struct ProviderSession {
+pub struct ProviderSessionDirectory {
+    pub path: PathBuf,
+    pub modified_ns: i64,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderDirectoryInventory {
+    pub directories: Vec<ProviderSessionDirectory>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderSessionSource {
     pub session_id: String,
     pub title: Option<String>,
+    pub source_path: PathBuf,
+    pub source_size: i64,
+    pub source_modified_ns: i64,
+    pub last_modified: Option<i64>,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderSessionCard {
     pub first_user_input: Option<String>,
     pub last_user_input: Option<String>,
     pub last_message_preview: Option<String>,
     pub last_message_role: Option<String>,
     pub working_directory: Option<String>,
-    pub last_modified: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,10 +244,17 @@ pub fn registry() -> &'static ProviderRegistry {
 pub trait SessionProvider {
     fn descriptor(&self) -> &'static ProviderDescriptor;
     fn sessions_root(&self) -> Option<PathBuf>;
-    fn list_sessions(&self) -> Result<Vec<ProviderSession>, String>;
     fn search_sessions(&self, query: &str) -> Result<Vec<ProviderSessionSearchMatch>, String>;
     fn session_history(&self, session_id: &str) -> Result<ProviderSessionHistory, String>;
     fn resume_command(&self, session_id: &str, working_directory: Option<&str>) -> ResumeCommand;
+    fn session_directories(
+        &self,
+        known_directories: &[ProviderSessionDirectory],
+    ) -> ProviderDirectoryInventory;
+    fn sessions_in_directory(
+        &self,
+        directory: &ProviderSessionDirectory,
+    ) -> Result<Vec<ProviderSessionSource>, String>;
 
     fn id(&self) -> &'static str {
         self.descriptor().id
@@ -251,6 +279,184 @@ pub trait SessionProvider {
     fn delete_session(&self, _session_id: &str) -> Result<(), String> {
         Err(format!("{} does not support deletion", self.display_name()))
     }
+}
+
+fn collect_session_directories(
+    roots: &[(PathBuf, bool)],
+    max_depth: usize,
+    known_directories: &[ProviderSessionDirectory],
+) -> ProviderDirectoryInventory {
+    let mut directories = Vec::new();
+    let mut complete = true;
+    let known_modified = known_directories
+        .iter()
+        .map(|directory| (directory.path.clone(), directory.modified_ns))
+        .collect::<HashMap<_, _>>();
+    let mut known_children = HashMap::<PathBuf, Vec<PathBuf>>::new();
+
+    for directory in known_directories {
+        if let Some(parent) = directory.path.parent() {
+            known_children
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push(directory.path.clone());
+        }
+    }
+
+    for (root, is_active) in roots {
+        match root.try_exists() {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        }
+
+        let mut walk = DirectoryWalk {
+            max_depth,
+            directories: &mut directories,
+            complete: &mut complete,
+            known_modified: &known_modified,
+            known_children: &known_children,
+        };
+        collect_session_directories_inner(root, *is_active, 0, &mut walk);
+    }
+
+    ProviderDirectoryInventory {
+        directories,
+        complete,
+    }
+}
+
+struct DirectoryWalk<'a> {
+    max_depth: usize,
+    directories: &'a mut Vec<ProviderSessionDirectory>,
+    complete: &'a mut bool,
+    known_modified: &'a HashMap<PathBuf, i64>,
+    known_children: &'a HashMap<PathBuf, Vec<PathBuf>>,
+}
+
+fn collect_session_directories_inner(
+    directory: &Path,
+    is_active: bool,
+    depth: usize,
+    walk: &mut DirectoryWalk<'_>,
+) {
+    if depth > walk.max_depth {
+        return;
+    }
+
+    let metadata = match fs::metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            *walk.complete = false;
+            return;
+        }
+    };
+    let Some(modified_ns) = modified_nanos(&metadata) else {
+        *walk.complete = false;
+        return;
+    };
+
+    walk.directories.push(ProviderSessionDirectory {
+        path: directory.to_path_buf(),
+        modified_ns,
+        is_active,
+    });
+
+    if depth >= walk.max_depth {
+        return;
+    }
+
+    if walk.known_modified.get(directory) == Some(&modified_ns) {
+        if let Some(children) = walk.known_children.get(directory).cloned() {
+            for child in children {
+                collect_session_directories_inner(&child, is_active, depth + 1, walk);
+            }
+        }
+
+        return;
+    }
+
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(_) => {
+            *walk.complete = false;
+            return;
+        }
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else {
+            *walk.complete = false;
+            continue;
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                *walk.complete = false;
+                continue;
+            }
+        };
+
+        let path = entry.path();
+
+        if file_type.is_dir() || (file_type.is_symlink() && path.is_dir()) {
+            collect_session_directories_inner(&path, is_active, depth + 1, walk);
+        }
+    }
+}
+
+fn session_sources_in_directory<F>(
+    directory: &ProviderSessionDirectory,
+    mut identify: F,
+) -> Result<Vec<ProviderSessionSource>, String>
+where
+    F: FnMut(&Path) -> Option<(String, Option<String>)>,
+{
+    let entries = fs::read_dir(&directory.path).map_err(|err| {
+        format!(
+            "Failed to read session directory {}: {err}",
+            directory.path.display()
+        )
+    })?;
+    let mut sessions = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "jsonl")
+        {
+            continue;
+        }
+
+        let Some((session_id, title)) = identify(&path) else {
+            continue;
+        };
+        let metadata = entry.metadata().map_err(|err| {
+            format!(
+                "Failed to read session metadata at {}: {err}",
+                path.display()
+            )
+        })?;
+
+        sessions.push(ProviderSessionSource {
+            session_id,
+            title,
+            source_path: path,
+            source_size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+            source_modified_ns: modified_nanos(&metadata).unwrap_or_default(),
+            last_modified: modified_seconds_from_metadata(&metadata),
+            is_active: directory.is_active,
+        });
+    }
+
+    Ok(sessions)
 }
 
 pub fn all() -> Vec<Box<dyn SessionProvider>> {
@@ -321,14 +527,16 @@ fn collect_jsonl_files_inner(
     }
 }
 
-fn modified_seconds(path: &Path) -> Option<i64> {
-    let modified = fs::metadata(path).ok()?.modified().ok()?;
+fn modified_seconds_from_metadata(metadata: &fs::Metadata) -> Option<i64> {
+    let modified = metadata.modified().ok()?;
     let duration = modified.duration_since(UNIX_EPOCH).ok()?;
     Some(duration.as_secs() as i64)
 }
 
-fn sort_recent_first(sessions: &mut [ProviderSession]) {
-    sessions.sort_by(|left, right| right.last_modified.cmp(&left.last_modified));
+fn modified_nanos(metadata: &fs::Metadata) -> Option<i64> {
+    let modified = metadata.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX))
 }
 
 fn chat_history_match(path: &Path, query: &str) -> Option<String> {
@@ -403,6 +611,7 @@ fn push_history_message(messages: &mut Vec<ProviderChatMessage>, message: Provid
     messages.push(message);
 }
 
+#[cfg(test)]
 fn session_card_previews(
     path: &Path,
 ) -> (
@@ -419,10 +628,6 @@ fn session_card_previews(
         metadata.last_message_preview,
         metadata.last_message_role,
     )
-}
-
-fn session_working_directory(path: &Path) -> Option<String> {
-    session_card_metadata(path).working_directory
 }
 
 fn session_card_metadata(path: &Path) -> SessionCardMetadata {
@@ -465,12 +670,44 @@ fn session_card_metadata(path: &Path) -> SessionCardMetadata {
     metadata
 }
 
+pub fn cached_session_card(
+    path: &Path,
+    source_size: i64,
+    source_modified_ns: i64,
+) -> Option<ProviderSessionCard> {
+    let cache = SESSION_CARD_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = cache.lock().ok()?;
+    let cached = cache.get(path)?;
+
+    if cached.fingerprint.length != source_size
+        || cached.fingerprint.modified_ns != source_modified_ns
+    {
+        return None;
+    }
+
+    Some(provider_session_card(cached.metadata.clone()))
+}
+
+pub fn load_session_card(path: &Path) -> ProviderSessionCard {
+    provider_session_card(session_card_metadata(path))
+}
+
+fn provider_session_card(metadata: SessionCardMetadata) -> ProviderSessionCard {
+    ProviderSessionCard {
+        first_user_input: metadata.first_user_input,
+        last_user_input: metadata.last_user_input,
+        last_message_preview: metadata.last_message_preview,
+        last_message_role: metadata.last_message_role,
+        working_directory: metadata.working_directory,
+    }
+}
+
 fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
     let metadata = fs::metadata(path).ok()?;
 
     Some(FileFingerprint {
-        length: metadata.len(),
-        modified: metadata.modified().ok()?,
+        length: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+        modified_ns: modified_nanos(&metadata)?,
     })
 }
 
@@ -634,9 +871,7 @@ fn is_user_message_object(value: &Value) -> bool {
 }
 
 fn chat_message_role(value: &Value) -> Option<&'static str> {
-    let Some(object) = value.as_object() else {
-        return None;
-    };
+    let object = value.as_object()?;
 
     for key in ["role", "type", "author", "speaker", "sender"] {
         if let Some(role) = normalized_chat_role(object.get(key)) {
@@ -894,8 +1129,8 @@ mod tests {
 
     #[test]
     fn only_codex_supports_single_session_deletion() {
-        assert!(codex::DESCRIPTOR.capabilities.delete_sessions);
-        assert!(!claude::DESCRIPTOR.capabilities.delete_sessions);
+        assert!(codex::CodexProvider.supports_delete());
+        assert!(!claude::ClaudeProvider.supports_delete());
     }
 
     #[test]

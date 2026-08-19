@@ -130,7 +130,9 @@ type CommandPaletteCommand = {
 const allCollectionsFilter = "__sessiondex_all_collections__";
 const unassignedCollectionFilter = "__sessiondex_unassigned_collection__";
 const secondsPerDay = 24 * 60 * 60;
-const autoRefreshIntervalMs = 30_000;
+const autoRefreshIntervalMs = 5 * 60_000;
+const initialSessionRenderLimit = 60;
+const sessionRenderStep = 60;
 const customSessionNameMaxLength = 100;
 const collectionNameMaxLength = 48;
 const tagNameMaxLength = 32;
@@ -853,13 +855,11 @@ function appWindowIsActive() {
   return document.visibilityState === "visible" && document.hasFocus();
 }
 
-type LoadDataOptions = {
-  background?: boolean;
-  skipIfBusy?: boolean;
-};
-
 function App() {
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
+  const [sessionRenderLimit, setSessionRenderLimit] = useState(
+    initialSessionRenderLimit,
+  );
   const [searchMatches, setSearchMatches] = useState<SessionSearchResult[]>([]);
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
@@ -918,6 +918,9 @@ function App() {
   const loadDataPromiseRef = useRef<Promise<void> | null>(null);
   const searchPromiseRef = useRef<Promise<SessionSearchResult[]> | null>(null);
   const lastRefreshStartedAtRef = useRef(0);
+  const hydratedSessionVersionsRef = useRef(new Set<string>());
+  const hydratingSessionVersionsRef = useRef(new Set<string>());
+  const [hydrationTick, setHydrationTick] = useState(0);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", settings.theme === "dark");
@@ -978,68 +981,121 @@ function App() {
     return settings.hardDeleteSessions && session.canDelete;
   }
 
-  const loadData = useCallback(
-    async ({ background = false, skipIfBusy = false }: LoadDataOptions = {}) => {
-      if (loadDataPromiseRef.current) {
-        if (skipIfBusy) {
-          return;
-        }
+  const loadData = useCallback(async () => {
+    if (loadDataPromiseRef.current) {
+      await loadDataPromiseRef.current;
+    }
 
-        await loadDataPromiseRef.current;
-      }
-
-      const refreshPromise = (async () => {
-        lastRefreshStartedAtRef.current = Date.now();
-
-        if (background) {
-          setRefreshing(true);
-        } else {
-          setLoading(true);
-          setError(null);
-        }
-
-        try {
-          const [nextSettings, nextProviders, nextSessions] =
-            await Promise.all([
-              api.getSettings(),
-              api.listProviders(),
-              api.listSessions(),
-            ]);
-
-          setSettings(nextSettings);
-          setProviders(nextProviders);
-          setSessions(nextSessions);
-        } catch (err) {
-          if (!background) {
-            setError(err instanceof Error ? err.message : String(err));
-          } else {
-            console.warn("Automatic session refresh failed.", err);
-          }
-        } finally {
-          if (background) {
-            setRefreshing(false);
-          } else {
-            setLoading(false);
-          }
-        }
-      })();
-
-      loadDataPromiseRef.current = refreshPromise;
+    const refreshPromise = (async () => {
+      lastRefreshStartedAtRef.current = Date.now();
+      setLoading(true);
+      setError(null);
 
       try {
-        await refreshPromise;
+        const [nextSettings, nextProviders, nextSessions] = await Promise.all([
+          api.getSettings(),
+          api.listProviders(),
+          api.listSessions(),
+        ]);
+
+        setSettings(nextSettings);
+        setProviders(nextProviders);
+        hydratedSessionVersionsRef.current.clear();
+        setSessions(nextSessions);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
       } finally {
-        if (loadDataPromiseRef.current === refreshPromise) {
-          loadDataPromiseRef.current = null;
-        }
+        setLoading(false);
       }
-    },
-    [],
-  );
+    })();
+
+    loadDataPromiseRef.current = refreshPromise;
+
+    try {
+      await refreshPromise;
+    } finally {
+      if (loadDataPromiseRef.current === refreshPromise) {
+        loadDataPromiseRef.current = null;
+      }
+    }
+  }, []);
+
+  const refreshData = useCallback(async (reportError = false) => {
+    if (loadDataPromiseRef.current) {
+      return;
+    }
+
+    const refreshPromise = (async () => {
+      lastRefreshStartedAtRef.current = Date.now();
+      setRefreshing(true);
+
+      if (reportError) {
+        setError(null);
+      }
+
+      try {
+        const [refresh, nextProviders] = await Promise.all([
+          api.refreshSessions(),
+          api.listProviders(),
+        ]);
+        const removedKeys = new Set(refresh.removed.map(sessionKey));
+        const upsertedByKey = new Map(
+          refresh.upserted.map((session) => [sessionKey(session), session]),
+        );
+
+        setProviders(nextProviders);
+
+        if (removedKeys.size > 0 || upsertedByKey.size > 0) {
+          setSessions((currentSessions) => {
+            const nextSessions = currentSessions
+              .filter((session) => !removedKeys.has(sessionKey(session)))
+              .map(
+                (session) =>
+                  upsertedByKey.get(sessionKey(session)) ?? session,
+              );
+            const existingKeys = new Set(nextSessions.map(sessionKey));
+
+            for (const session of refresh.upserted) {
+              if (!existingKeys.has(sessionKey(session))) {
+                nextSessions.push(session);
+              }
+            }
+
+            nextSessions.sort(
+              (left, right) =>
+                (right.lastModified ?? 0) - (left.lastModified ?? 0),
+            );
+            return nextSessions;
+          });
+        }
+      } catch (err) {
+        if (reportError) {
+          setError(err instanceof Error ? err.message : String(err));
+        } else {
+          console.warn("Session reconciliation failed.", err);
+        }
+      } finally {
+        setRefreshing(false);
+      }
+    })();
+
+    loadDataPromiseRef.current = refreshPromise;
+
+    try {
+      await refreshPromise;
+    } finally {
+      if (loadDataPromiseRef.current === refreshPromise) {
+        loadDataPromiseRef.current = null;
+      }
+    }
+  }, []);
 
   useEffect(() => {
-    void loadData();
-  }, [loadData]);
+    void (async () => {
+      await loadData();
+      await refreshData(true);
+    })();
+  }, [loadData, refreshData]);
 
   useEffect(() => {
     function updateAppActive() {
@@ -1071,7 +1127,7 @@ function App() {
         return;
       }
 
-      void loadData({ background: true, skipIfBusy: true });
+      void refreshData();
     }
 
     refreshIfStale();
@@ -1081,7 +1137,7 @@ function App() {
     );
 
     return () => window.clearInterval(intervalId);
-  }, [appActive, loadData]);
+  }, [appActive, refreshData]);
 
   const advancedSearch = useMemo(() => parseAdvancedSearch(search), [search]);
 
@@ -1550,7 +1606,7 @@ function App() {
     return filteredSessions.filter((session) => session.isPinned).length;
   }, [filteredSessions]);
 
-  const displayedSessions = useMemo(() => {
+  const allDisplayedSessions = useMemo(() => {
     return filteredSessions
       .map((session, index) => ({ session, index }))
       .filter(({ session }) => sessionView === "all" || session.isPinned)
@@ -1573,6 +1629,100 @@ function App() {
       })
       .map(({ session }) => session);
   }, [activityFilter, filteredSessions, sessionView]);
+
+  const displayedSessions = useMemo(
+    () => allDisplayedSessions.slice(0, sessionRenderLimit),
+    [allDisplayedSessions, sessionRenderLimit],
+  );
+  const hasMoreSessions = displayedSessions.length < allDisplayedSessions.length;
+
+  useEffect(() => {
+    setSessionRenderLimit(initialSessionRenderLimit);
+  }, [
+    activityFilter,
+    collectionFilter,
+    metadataFilterType,
+    metadataFilterValue,
+    search,
+    sessionView,
+    settings.providerFilter,
+    settings.showHiddenSessions,
+  ]);
+
+  useEffect(() => {
+    const batch = displayedSessions
+      .map((session) => ({
+        session,
+        versionKey: `${sessionKey(session)}:${session.sourceVersion}`,
+      }))
+      .filter(
+        ({ versionKey }) =>
+          !hydratedSessionVersionsRef.current.has(versionKey) &&
+          !hydratingSessionVersionsRef.current.has(versionKey),
+      )
+      .slice(0, sessionRenderStep);
+
+    if (batch.length === 0) {
+      return;
+    }
+
+    for (const { versionKey } of batch) {
+      hydratingSessionVersionsRef.current.add(versionKey);
+    }
+
+    async function hydrateCards() {
+      try {
+        const details = await api.hydrateSessionCards(
+          batch.map(({ session }) => ({
+            provider: session.provider,
+            sessionId: session.sessionId,
+          })),
+        );
+
+        const detailsBySession = new Map(
+          details.map((detail) => [sessionKey(detail), detail]),
+        );
+        setSessions((currentSessions) =>
+          currentSessions.map((session) => {
+            const detail = detailsBySession.get(sessionKey(session));
+
+            if (!detail) {
+              return session;
+            }
+
+            if (session.sourceVersion !== detail.sourceVersion) {
+              return session;
+            }
+
+            return {
+              ...session,
+              firstUserInput: detail.firstUserInput,
+              lastUserInput: detail.lastUserInput,
+              lastMessagePreview: detail.lastMessagePreview,
+              lastMessageRole: detail.lastMessageRole,
+              workingDirectory: detail.workingDirectory,
+              discoveredRepository: detail.discoveredRepository,
+              discoveredBranch: detail.discoveredBranch,
+              discoveredAt: detail.discoveredAt,
+              resumeCommand: detail.resumeCommand,
+              isFavoriteProject: detail.isFavoriteProject,
+            };
+          }),
+        );
+      } catch (err) {
+        console.warn("Session card hydration failed.", err);
+      } finally {
+        for (const { versionKey } of batch) {
+          hydratingSessionVersionsRef.current.delete(versionKey);
+          hydratedSessionVersionsRef.current.add(versionKey);
+        }
+
+        setHydrationTick((current) => current + 1);
+      }
+    }
+
+    void hydrateCards();
+  }, [displayedSessions, hydrationTick]);
 
   const selectedSessionIndex = useMemo(() => {
     return displayedSessions.findIndex(
@@ -2111,14 +2261,29 @@ function App() {
       return;
     }
 
+    const target = deleteTarget;
+
     try {
       const result = await api.deleteOrHideSession(
-        deleteTarget.provider,
-        deleteTarget.sessionId,
+        target.provider,
+        target.sessionId,
       );
       setDeleteTarget(null);
       setMessage(result.message);
-      await loadData();
+
+      if (result.action === "deleted") {
+        const targetKey = sessionKey(target);
+        setSessions((currentSessions) =>
+          currentSessions.filter(
+            (currentSession) => sessionKey(currentSession) !== targetKey,
+          ),
+        );
+      } else {
+        updateSession(target, (currentSession) => ({
+          ...currentSession,
+          isHidden: true,
+        }));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -2131,7 +2296,10 @@ function App() {
     try {
       await api.unhideSession(session.provider, session.sessionId);
       setMessage("Session restored to the dashboard.");
-      await loadData();
+      updateSession(session, (currentSession) => ({
+        ...currentSession,
+        isHidden: false,
+      }));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -2262,7 +2430,7 @@ function App() {
       keywords: ["reload", "sync"],
       disabled: isRefreshingSessions,
       perform: () => {
-        void loadData();
+        void refreshData(true);
       },
     },
     {
@@ -2701,7 +2869,7 @@ function App() {
         (hasNoModifiers && key === "F5")
       ) {
         event.preventDefault();
-        void loadData();
+        void refreshData(true);
         return;
       }
 
@@ -2847,6 +3015,7 @@ function App() {
     displayedSessions,
     historyTarget,
     noteTarget,
+    refreshData,
     renameTarget,
     search,
     selectedSession,
@@ -2932,7 +3101,7 @@ function App() {
               disabled={isRefreshingSessions}
               icon={RotateCw}
               iconClassName={isRefreshingSessions ? "animate-spin" : undefined}
-              onClick={() => void loadData()}
+              onClick={() => void refreshData(true)}
             />
             <HeaderActionButton
               title="Command palette (Cmd/Ctrl+Shift+P)"
@@ -3488,6 +3657,20 @@ function App() {
             })
           )}
         </section>
+
+        {hasMoreSessions && (
+          <div className="mt-5 flex justify-center">
+            <Button
+              variant="secondary"
+              onClick={() =>
+                setSessionRenderLimit((current) => current + sessionRenderStep)
+              }
+            >
+              Load more sessions ({displayedSessions.length} of{" "}
+              {allDisplayedSessions.length})
+            </Button>
+          </div>
+        )}
       </div>
 
       {commandPaletteOpen && (

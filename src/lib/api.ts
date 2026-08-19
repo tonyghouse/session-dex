@@ -4,14 +4,19 @@ import type {
   CollectionColorName,
   DeleteResult,
   ProviderStatus,
+  SessionCardDetails,
   SessionHistory,
   SessionRecord,
+  SessionRefresh,
   SessionSearchResult,
   UninstallResult,
 } from "./types";
 
 export const api = {
   listSessions: () => invoke<SessionRecord[]>("list_sessions"),
+  refreshSessions: () => invoke<SessionRefresh>("refresh_sessions"),
+  hydrateSessionCards: (sessions: Array<{ provider: string; sessionId: string }>) =>
+    invoke<SessionCardDetails[]>("hydrate_session_cards", { sessions }),
   searchSessions: (query: string, providerFilter: string | null) =>
     invoke<SessionSearchResult[]>("search_sessions", {
       query,

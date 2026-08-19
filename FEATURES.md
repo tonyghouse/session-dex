@@ -148,6 +148,7 @@ What this provides:
 - Favorite project markers by working directory.
 - Hidden sessions.
 - Recently resumed timestamps.
+- A derived session index containing provider/session IDs, source paths, file fingerprints, active/archive state, and cached working directories. Transcript text is not persisted in the index.
 
 Important behavior:
 
@@ -159,6 +160,9 @@ Important behavior:
 - Tags entered through the UI are normalized to lowercase, must start with a letter or number, and can then use letters, numbers, dashes, underscores, and dots.
 - Tags are limited to 32 characters each.
 - Project favorites apply by working directory, so sessions from the same project show the same favorite marker.
+- After a successful provider-directory reconciliation, metadata for sessions confirmed deleted outside SessionDex is removed transactionally.
+- Incomplete or unreadable provider scans never trigger provider-wide metadata cleanup.
+- Codex archive and unarchive moves retain SessionDex metadata because identity is keyed by provider and session ID rather than source path.
 
 Why it matters:
 
@@ -289,9 +293,17 @@ SessionDex keeps session data current while staying explicit about user actions.
 What this provides:
 
 - Manual refresh from the header or keyboard.
-- Automatic refresh every 30 seconds while the app window is visible and focused.
+- SQLite-first startup rendering followed by mandatory lightweight session reconciliation.
+- Scheduled reconciliation every five minutes while the app window is visible and focused; SessionDex does not keep a continuously running filesystem watcher.
+- A ten-minute overlap around the last successful provider scan protects timestamp-boundary changes.
+- Directory modification watermarks skip unchanged subtrees, while each pass audits up to 32 older session-bearing directories to detect file changes that do not alter parent-directory timestamps.
 - Background refresh avoids overlapping refresh work.
-- Unchanged session files reuse lightweight in-memory card metadata instead of reparsing their histories.
+- SQLite reconciliation updates only changed directory/session rows and removes confirmed missing session metadata in the same transaction.
+- Scheduled reconciliation returns only changed or removed sessions to the frontend instead of retransmitting the complete indexed collection.
+- Initial loading uses the derived index without parsing every JSONL transcript.
+- Session previews and branch context hydrate lazily in batches of up to 60 rendered cards.
+- The dashboard renders 60 matching cards initially and exposes explicit incremental loading for larger result sets.
+- Unchanged hydrated session files reuse lightweight in-memory card metadata instead of reparsing their histories.
 - Chat-history searches are serialized so rapid typing cannot start overlapping full-history scans.
 - Off-screen session cards defer browser layout and paint work until they approach the viewport.
 - Success and error messages for resume, rename, collection, note, tag, hide, unhide, copy, and folder actions.
