@@ -374,8 +374,8 @@ For each session you can:
 - open searchable chat history with collapsible message bubbles
 - resume the session in your configured terminal
 - rename it locally inside SessionDex
-- delete it if the provider supports deletion
-- hide it from SessionDex if provider deletion is not supported
+- permanently delete Codex sessions when hard deletion is explicitly enabled in Settings
+- hide sessions when hard deletion is disabled or the provider does not support single-session deletion
 - show hidden sessions from Settings and unhide them later
 
 Search matches custom session names, session ids, providers, notes, tags, collections, working directories, discovered Git context, and local chat history. The dashboard also includes a searchable metadata filter for projects, tags, and collections with up to 10 recent suggestions. Chat-history search scans provider session files on demand and matches extracted user and assistant message text. It does not copy full transcripts into SessionDex SQLite, use embeddings, or call any cloud service.

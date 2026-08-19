@@ -476,12 +476,16 @@ fn delete_or_hide_session(
 ) -> Result<DeleteResult, String> {
     let provider_impl =
         providers::by_id(&provider).ok_or_else(|| format!("Unsupported provider: {provider}"))?;
+    let settings = state.db.get_settings()?;
 
-    if provider_impl.supports_delete() {
+    if settings.hard_delete_sessions && provider_impl.supports_delete() {
         provider_impl.delete_session(&session_id)?;
         return Ok(DeleteResult {
             action: "deleted".to_string(),
-            message: "Session deleted by provider.".to_string(),
+            message: format!(
+                "{} session permanently deleted.",
+                provider_impl.display_name()
+            ),
         });
     }
 

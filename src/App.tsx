@@ -57,6 +57,7 @@ const defaultSettings: AppSettings = {
   terminalExecutable: null,
   providerFilter: "all",
   showHiddenSessions: false,
+  hardDeleteSessions: false,
 };
 
 type ToastState = {
@@ -971,6 +972,10 @@ function App() {
       description,
       tone,
     });
+  }
+
+  function hardDeleteEnabledFor(session: SessionRecord) {
+    return settings.hardDeleteSessions && session.canDelete;
   }
 
   const loadData = useCallback(
@@ -2468,13 +2473,13 @@ function App() {
       id: "selected.visibility",
       label: activeSession?.isHidden
         ? "Unhide selected session"
-        : activeSession?.canDelete
+        : activeSession && hardDeleteEnabledFor(activeSession)
           ? "Delete selected session"
           : "Hide selected session",
       detail: activeSessionName,
       icon: activeSession?.isHidden
         ? Eye
-        : activeSession?.canDelete
+        : activeSession && hardDeleteEnabledFor(activeSession)
           ? Trash
           : EyeOff,
       keywords: activeSession ? sessionCommandKeywords(activeSession) : [],
@@ -3456,14 +3461,20 @@ function App() {
                               </Button>
                               <IconActionButton
                                 title={
-                                  session.canDelete
+                                  hardDeleteEnabledFor(session)
                                     ? "Delete session (Del)"
                                     : "Hide session (Del)"
                                 }
                                 aria-keyshortcuts="Delete"
                                 onClick={() => setDeleteTarget(session)}
-                                icon={session.canDelete ? Trash : EyeOff}
-                                tone={session.canDelete ? "danger" : "neutral"}
+                                icon={
+                                  hardDeleteEnabledFor(session) ? Trash : EyeOff
+                                }
+                                tone={
+                                  hardDeleteEnabledFor(session)
+                                    ? "danger"
+                                    : "neutral"
+                                }
                                 className="h-9 w-9 rounded-lg"
                               />
                             </>
@@ -3924,14 +3935,20 @@ function App() {
 
       {deleteTarget && (
         <Modal
-          title={deleteTarget.canDelete ? "Delete session" : "Hide session"}
+          title={
+            hardDeleteEnabledFor(deleteTarget)
+              ? "Permanently delete session"
+              : "Hide session"
+          }
           onClose={() => setDeleteTarget(null)}
         >
           <div className="space-y-4">
             <p className="text-sm text-slate-600 dark:text-slate-300">
-              {deleteTarget.canDelete
-                ? "This provider supports deletion. SessionDex will ask the provider to delete this session."
-                : "This provider does not expose safe deletion. SessionDex will hide this session from its own dashboard only."}
+              {hardDeleteEnabledFor(deleteTarget)
+                ? "This permanently deletes the session through its provider. This action cannot be undone."
+                : deleteTarget.canDelete
+                  ? "Hard delete is disabled in Settings. SessionDex will hide this session from its own dashboard only."
+                  : "This provider does not expose single-session deletion. SessionDex will hide this session from its own dashboard only."}
             </p>
             <div className="rounded-lg bg-slate-100 p-3 font-mono text-xs text-slate-600 dark:bg-slate-900 dark:text-slate-300">
               {deleteTarget.sessionId}
@@ -3941,10 +3958,14 @@ function App() {
                 Cancel
               </Button>
               <Button
-                variant={deleteTarget.canDelete ? "danger" : "primary"}
+                variant={
+                  hardDeleteEnabledFor(deleteTarget) ? "danger" : "primary"
+                }
                 onClick={() => void confirmDeleteOrHide()}
               >
-                {deleteTarget.canDelete ? "Delete" : "Hide"}
+                {hardDeleteEnabledFor(deleteTarget)
+                  ? "Permanently delete"
+                  : "Hide"}
               </Button>
             </div>
           </div>
@@ -4964,6 +4985,31 @@ function SettingsModal({
                   setDraft({
                     ...draft,
                     showHiddenSessions: event.target.checked,
+                  })
+                }
+                className="h-4 w-4 shrink-0"
+              />
+            </label>
+          </SettingsSection>
+
+          <SettingsSection icon={Trash} title="Hard Delete">
+            <label className="flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50/80 px-3 py-2.5 dark:border-red-950/80 dark:bg-red-950/20">
+              <span className="min-w-0">
+                <span className="block text-sm font-medium">
+                  Enable permanent session deletion
+                </span>
+                <span className="mt-0.5 block text-xs text-slate-500 dark:text-slate-400">
+                  Uses supported provider deletion commands. Codex sessions can
+                  be permanently deleted; Claude sessions are still hidden.
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                checked={draft.hardDeleteSessions}
+                onChange={(event) =>
+                  setDraft({
+                    ...draft,
+                    hardDeleteSessions: event.target.checked,
                   })
                 }
                 className="h-4 w-4 shrink-0"

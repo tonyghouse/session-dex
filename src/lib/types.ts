@@ -71,6 +71,7 @@ export interface AppSettings {
   terminalExecutable: string | null;
   providerFilter: string;
   showHiddenSessions: boolean;
+  hardDeleteSessions: boolean;
 }
 
 export interface DeleteResult {

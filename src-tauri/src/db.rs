@@ -723,6 +723,7 @@ impl Database {
                 }
                 "provider_filter" if !value.trim().is_empty() => settings.provider_filter = value,
                 "show_hidden_sessions" => settings.show_hidden_sessions = value == "true",
+                "hard_delete_sessions" => settings.hard_delete_sessions = value == "true",
                 _ => {}
             }
         }
@@ -790,6 +791,20 @@ impl Database {
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             "#,
             params![if settings.show_hidden_sessions {
+                "true"
+            } else {
+                "false"
+            }],
+        )
+        .map_err(|err| err.to_string())?;
+
+        conn.execute(
+            r#"
+            INSERT INTO settings (key, value)
+            VALUES ('hard_delete_sessions', ?1)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            params![if settings.hard_delete_sessions {
                 "true"
             } else {
                 "false"

@@ -5,6 +5,7 @@ use super::{
     ProviderSessionSearchMatch, ResumeCommand, SessionProvider,
 };
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub struct CodexProvider;
 
@@ -13,7 +14,14 @@ pub const DESCRIPTOR: ProviderDescriptor = ProviderDescriptor {
     display_name: "Codex",
     executable: "codex",
     session_store: "~/.codex/sessions",
-    capabilities: ProviderCapabilities::LOCAL_SESSION_FILES,
+    capabilities: ProviderCapabilities {
+        discover_sessions: true,
+        search_sessions: true,
+        read_history: true,
+        resume_sessions: true,
+        delete_sessions: true,
+        watch_sessions: false,
+    },
 };
 
 pub const REGISTRATION: ProviderRegistration = ProviderRegistration {
@@ -106,6 +114,41 @@ impl SessionProvider for CodexProvider {
             program: "codex",
             args: vec!["resume".to_string(), session_id.to_string()],
             working_directory: working_directory.map(str::to_string),
+        }
+    }
+
+    fn delete_session(&self, session_id: &str) -> Result<(), String> {
+        if !looks_like_uuid(session_id) {
+            return Err("Codex hard deletion requires a UUID session ID.".to_string());
+        }
+
+        if self.session_path(session_id).is_none() {
+            return Err(format!("Codex session not found: {session_id}"));
+        }
+
+        let output = Command::new(self.executable())
+            .args(["delete", "--force", session_id])
+            .output()
+            .map_err(|err| format!("Could not run Codex session deletion: {err}"))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if detail.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            detail
+        };
+
+        if detail.is_empty() {
+            Err(format!(
+                "Codex could not delete the session (exit status {}).",
+                output.status
+            ))
+        } else {
+            Err(format!("Codex could not delete the session: {detail}"))
         }
     }
 }

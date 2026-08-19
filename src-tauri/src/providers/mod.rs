@@ -893,6 +893,12 @@ mod tests {
     }
 
     #[test]
+    fn only_codex_supports_single_session_deletion() {
+        assert!(codex::DESCRIPTOR.capabilities.delete_sessions);
+        assert!(!claude::DESCRIPTOR.capabilities.delete_sessions);
+    }
+
+    #[test]
     fn extracts_codex_payload_user_message_preview() {
         let value = json!({
             "type": "response_item",

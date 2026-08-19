@@ -240,10 +240,12 @@ SessionDex separates provider deletion from local hiding.
 
 What this provides:
 
-- If a provider supports safe deletion, SessionDex calls the provider's delete operation.
-- If a provider does not support deletion, SessionDex hides the session from its own dashboard.
+- When hard deletion is enabled and a provider supports it, SessionDex calls the provider's delete operation.
+- When hard deletion is disabled or a provider does not support it, SessionDex hides the session from its own dashboard.
 - Hidden sessions can be shown from Settings and restored with Unhide.
-- Current built-in Codex and Claude providers do not advertise deletion support, so their sessions are hidden rather than deleted.
+- Hard deletion is disabled by default and must be explicitly enabled in Settings.
+- Codex hard deletion uses the provider CLI's permanent `delete --force` operation.
+- Claude does not expose a single-session deletion command, so Claude sessions are hidden rather than deleted.
 
 Why it matters:
 
@@ -312,6 +314,7 @@ What this provides:
 - Detected or Missing status for built-in provider CLIs.
 - Terminal executable override.
 - Hidden session visibility toggle.
+- Opt-in hard deletion for providers that support single-session deletion.
 - Built-in keyboard shortcut reference.
 
 Persisted settings:
@@ -320,6 +323,7 @@ Persisted settings:
 - Terminal executable override.
 - Provider filter.
 - Show hidden sessions.
+- Hard delete sessions.
 
 Why it matters:
 

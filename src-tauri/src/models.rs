@@ -75,6 +75,7 @@ pub struct AppSettings {
     pub terminal_executable: Option<String>,
     pub provider_filter: String,
     pub show_hidden_sessions: bool,
+    pub hard_delete_sessions: bool,
 }
 
 impl Default for AppSettings {
@@ -84,6 +85,7 @@ impl Default for AppSettings {
             terminal_executable: None,
             provider_filter: "all".to_string(),
             show_hidden_sessions: false,
+            hard_delete_sessions: false,
         }
     }
 }
