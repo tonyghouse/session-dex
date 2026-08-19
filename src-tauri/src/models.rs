@@ -109,13 +109,15 @@ pub struct ProviderStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct AppSettings {
     pub theme: String,
     pub terminal_executable: Option<String>,
     pub provider_filter: String,
     pub show_hidden_sessions: bool,
     pub hard_delete_sessions: bool,
+    pub rendering_profile: String,
+    pub rendering_profile_notice_pending: bool,
 }
 
 impl Default for AppSettings {
@@ -126,6 +128,8 @@ impl Default for AppSettings {
             provider_filter: "all".to_string(),
             show_hidden_sessions: false,
             hard_delete_sessions: false,
+            rendering_profile: crate::system_profile::FULL_EFFECTS_PROFILE.to_string(),
+            rendering_profile_notice_pending: false,
         }
     }
 }

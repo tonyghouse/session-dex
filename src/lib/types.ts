@@ -1,4 +1,5 @@
 export type Theme = "light" | "dark";
+export type RenderingProfile = "full" | "balanced" | "efficiency";
 export type CollectionColorName =
   | "gray"
   | "red"
@@ -99,6 +100,8 @@ export interface AppSettings {
   providerFilter: string;
   showHiddenSessions: boolean;
   hardDeleteSessions: boolean;
+  renderingProfile: RenderingProfile;
+  renderingProfileNoticePending: boolean;
 }
 
 export interface DeleteResult {

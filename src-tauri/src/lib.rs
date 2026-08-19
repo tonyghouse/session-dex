@@ -2,6 +2,7 @@ mod db;
 mod instance;
 mod models;
 mod providers;
+mod system_profile;
 mod terminal;
 
 use db::{
@@ -700,7 +701,16 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettings, String
 
 #[tauri::command]
 fn save_settings(state: tauri::State<'_, AppState>, settings: AppSettings) -> Result<(), String> {
+    if !system_profile::is_rendering_profile(&settings.rendering_profile) {
+        return Err("Unsupported rendering profile.".to_string());
+    }
+
     state.db.save_settings(&settings)
+}
+
+#[tauri::command]
+fn dismiss_rendering_profile_notice(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.db.dismiss_rendering_profile_notice()
 }
 
 #[tauri::command]
@@ -1125,6 +1135,14 @@ pub fn run() {
             let db = Database::new(db_path);
             db.init().map_err(std::io::Error::other)?;
 
+            if !db
+                .rendering_profile_initialized()
+                .map_err(std::io::Error::other)?
+            {
+                db.initialize_rendering_profile(system_profile::recommended_rendering_profile())
+                    .map_err(std::io::Error::other)?;
+            }
+
             app.manage(AppState { db });
             start_instance_dispatcher(app.handle().clone(), instance_owner)
                 .map_err(std::io::Error::other)?;
@@ -1140,6 +1158,7 @@ pub fn run() {
             list_repository_branches,
             get_settings,
             save_settings,
+            dismiss_rendering_profile_notice,
             rename_session,
             set_session_pinned,
             set_session_discovered_branch,

@@ -365,11 +365,13 @@ SessionDex runs as one foreground GUI process per signed-in user. Launching it a
 
 The dashboard shows detected sessions from supported providers. Provider connection status is available in Settings under Detected AI CLIs.
 
+On the first application launch, SessionDex performs a local CPU, memory, and graphics-capability check and persists one of three cross-platform Rendering Profiles: Enhanced, Balanced, or Efficiency. Enhanced is selected silently; if SessionDex selects Balanced or Efficiency, it explains the reduced visual workload once at startup. The profile can always be changed later in Settings, and the capability check does not run again after setup.
+
 SessionDex renders its lightweight SQLite session index first, then reconciles it against provider directories at every startup, on manual Refresh, and every five minutes while the window is active. Reconciliation uses directory watermarks, a ten-minute last-scan overlap, and a bounded rolling audit instead of a continuously running filesystem watcher. Confirmed external deletions remove only the matching SessionDex session metadata after a successful provider scan; incomplete scans never trigger provider-wide cleanup.
 
 Scheduled reconciliations send only changed and removed session records back to the dashboard rather than retransmitting the entire indexed collection.
 
-The persistent index contains provider/session IDs, source paths, file fingerprints, active/archive state, and cached working directories, but no transcript text. Card previews remain in process memory and are parsed lazily for the first 60 rendered cards, with additional cards loaded explicitly in groups of 60.
+The persistent index contains provider/session IDs, source paths, file fingerprints, active/archive state, and cached working directories, but no transcript text. Card previews remain in process memory and hydrate lazily after startup reconciliation. Initial card counts and hydration batch sizes follow the selected Rendering Profile, with additional cards loaded explicitly in profile-sized groups.
 
 Resume opens the selected session in Terminal on macOS, an auto-detected terminal emulator on Linux, and Windows Terminal, PowerShell, or Command Prompt on Windows.
 

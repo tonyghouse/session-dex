@@ -1,4 +1,5 @@
 use crate::models::AppSettings;
+use crate::system_profile;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -1262,6 +1263,87 @@ impl Database {
         Ok(())
     }
 
+    pub fn rendering_profile_initialized(&self) -> Result<bool, String> {
+        let conn = self.connection()?;
+        let profile = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'rendering_profile'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| err.to_string())?;
+
+        Ok(profile
+            .as_deref()
+            .is_some_and(system_profile::is_rendering_profile))
+    }
+
+    pub fn initialize_rendering_profile(&self, profile: &str) -> Result<(), String> {
+        if !system_profile::is_rendering_profile(profile) {
+            return Err(format!("Unsupported rendering profile: {profile}"));
+        }
+
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction().map_err(|err| err.to_string())?;
+        let existing_profile = transaction
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'rendering_profile'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| err.to_string())?;
+
+        if existing_profile
+            .as_deref()
+            .is_some_and(system_profile::is_rendering_profile)
+        {
+            transaction.commit().map_err(|err| err.to_string())?;
+            return Ok(());
+        }
+
+        transaction
+            .execute(
+                r#"
+                INSERT INTO settings (key, value)
+                VALUES ('rendering_profile', ?1)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                "#,
+                params![profile],
+            )
+            .map_err(|err| err.to_string())?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO settings (key, value)
+                VALUES ('rendering_profile_notice_pending', ?1)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                "#,
+                params![if profile == system_profile::FULL_EFFECTS_PROFILE {
+                    "false"
+                } else {
+                    "true"
+                }],
+            )
+            .map_err(|err| err.to_string())?;
+        transaction.commit().map_err(|err| err.to_string())
+    }
+
+    pub fn dismiss_rendering_profile_notice(&self) -> Result<(), String> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"
+            INSERT INTO settings (key, value)
+            VALUES ('rendering_profile_notice_pending', 'false')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            [],
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
     pub fn get_settings(&self) -> Result<AppSettings, String> {
         let conn = self.connection()?;
         let mut settings = AppSettings::default();
@@ -1287,6 +1369,12 @@ impl Database {
                 "provider_filter" if !value.trim().is_empty() => settings.provider_filter = value,
                 "show_hidden_sessions" => settings.show_hidden_sessions = value == "true",
                 "hard_delete_sessions" => settings.hard_delete_sessions = value == "true",
+                "rendering_profile" if system_profile::is_rendering_profile(&value) => {
+                    settings.rendering_profile = value
+                }
+                "rendering_profile_notice_pending" => {
+                    settings.rendering_profile_notice_pending = value == "true"
+                }
                 _ => {}
             }
         }
@@ -1372,6 +1460,22 @@ impl Database {
             } else {
                 "false"
             }],
+        )
+        .map_err(|err| err.to_string())?;
+
+        let rendering_profile = if system_profile::is_rendering_profile(&settings.rendering_profile)
+        {
+            settings.rendering_profile.as_str()
+        } else {
+            system_profile::FULL_EFFECTS_PROFILE
+        };
+        conn.execute(
+            r#"
+            INSERT INTO settings (key, value)
+            VALUES ('rendering_profile', ?1)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            params![rendering_profile],
         )
         .map_err(|err| err.to_string())?;
 
@@ -1556,6 +1660,38 @@ mod tests {
         let database = Database::new(path.clone());
         database.init().expect("test database should initialize");
         (database, path)
+    }
+
+    #[test]
+    fn rendering_profile_setup_and_notice_are_persisted_once() {
+        let (database, path) = test_database();
+
+        assert!(!database.rendering_profile_initialized().unwrap());
+        database
+            .initialize_rendering_profile(system_profile::BALANCED_PROFILE)
+            .unwrap();
+
+        let settings = database.get_settings().unwrap();
+        assert_eq!(settings.rendering_profile, system_profile::BALANCED_PROFILE);
+        assert!(settings.rendering_profile_notice_pending);
+
+        database.dismiss_rendering_profile_notice().unwrap();
+        database
+            .initialize_rendering_profile(system_profile::EFFICIENCY_PROFILE)
+            .unwrap();
+
+        let mut settings = database.get_settings().unwrap();
+        assert_eq!(settings.rendering_profile, system_profile::BALANCED_PROFILE);
+        assert!(!settings.rendering_profile_notice_pending);
+
+        settings.rendering_profile = system_profile::FULL_EFFECTS_PROFILE.to_string();
+        database.save_settings(&settings).unwrap();
+        assert_eq!(
+            database.get_settings().unwrap().rendering_profile,
+            system_profile::FULL_EFFECTS_PROFILE
+        );
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

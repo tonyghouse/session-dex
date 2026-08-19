@@ -302,8 +302,8 @@ What this provides:
 - SQLite reconciliation updates only changed directory/session rows and removes confirmed missing session metadata in the same transaction.
 - Scheduled reconciliation returns only changed or removed sessions to the frontend instead of retransmitting the complete indexed collection.
 - Initial loading uses the derived index without parsing every JSONL transcript.
-- Session previews and branch context hydrate lazily in batches of up to 60 rendered cards.
-- The dashboard renders 60 matching cards initially and exposes explicit incremental loading for larger result sets.
+- Session previews and branch context hydrate lazily in profile-sized batches after startup reconciliation finishes.
+- The dashboard initially renders 60 cards with Enhanced, 42 with Balanced, or 24 with Efficiency, then exposes explicit incremental loading using the same profile-sized steps.
 - Unchanged hydrated session files reuse lightweight in-memory card metadata instead of reparsing their histories.
 - Chat-history searches are serialized so rapid typing cannot start overlapping full-history scans.
 - Off-screen session cards defer browser layout and paint work until they approach the viewport.
@@ -324,6 +324,10 @@ SessionDex includes a compact settings panel for local preferences and diagnosti
 What this provides:
 
 - Light and dark theme selection.
+- Cross-platform Rendering Profile choices: Enhanced, Balanced, and Efficiency.
+- On first application launch, SessionDex locally assesses logical CPU count, memory, and available graphics acceleration, then persists a recommended profile instead of probing on every startup.
+- Enhanced is selected silently. An automatically selected Balanced or Efficiency profile shows one startup explanation, which is not shown again after it is acknowledged.
+- Rendering profiles adjust translucency, blur, card shadows, initial card counts, and session-preview hydration batch sizes. Users can override the selected profile at any time.
 - Detected or Missing status for built-in provider CLIs.
 - Terminal executable override.
 - Hidden session visibility toggle.
@@ -337,10 +341,12 @@ Persisted settings:
 - Provider filter.
 - Show hidden sessions.
 - Hard delete sessions.
+- Rendering profile.
+- One-time rendering-profile notice acknowledgement.
 
 Why it matters:
 
-The app should work with sensible defaults while still allowing users to adapt terminal behavior and visibility preferences.
+The app adapts its initial rendering workload to local system capabilities while still allowing users to control visual effects, terminal behavior, and visibility preferences.
 
 ## 14. Project Folder Actions
 

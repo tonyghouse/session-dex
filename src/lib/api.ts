@@ -35,6 +35,8 @@ export const api = {
   getSettings: () => invoke<AppSettings>("get_settings"),
   saveSettings: (settings: AppSettings) =>
     invoke<void>("save_settings", { settings }),
+  dismissRenderingProfileNotice: () =>
+    invoke<void>("dismiss_rendering_profile_notice"),
   renameSession: (
     provider: string,
     sessionId: string,

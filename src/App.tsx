@@ -11,6 +11,7 @@ import {
   EyeOff,
   FolderOpen,
   FolderPlus,
+  Gauge,
   GitBranch,
   Hash,
   Keyboard,
@@ -45,6 +46,7 @@ import type {
   AppSettings,
   CollectionColorName,
   ProviderStatus,
+  RenderingProfile,
   SessionHistory,
   SessionMessage,
   SessionRecord,
@@ -58,6 +60,8 @@ const defaultSettings: AppSettings = {
   providerFilter: "all",
   showHiddenSessions: false,
   hardDeleteSessions: false,
+  renderingProfile: "full",
+  renderingProfileNoticePending: false,
 };
 
 type ToastState = {
@@ -131,13 +135,60 @@ const allCollectionsFilter = "__sessiondex_all_collections__";
 const unassignedCollectionFilter = "__sessiondex_unassigned_collection__";
 const secondsPerDay = 24 * 60 * 60;
 const autoRefreshIntervalMs = 5 * 60_000;
-const initialSessionRenderLimit = 60;
-const sessionRenderStep = 60;
 const customSessionNameMaxLength = 100;
 const collectionNameMaxLength = 48;
 const tagNameMaxLength = 32;
 const tagNamePattern = /^[a-z0-9][a-z0-9._-]*$/;
 const metadataFilterOptionLimit = 10;
+const renderingProfileOptions: Array<{
+  value: RenderingProfile;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: "full",
+    label: "Enhanced",
+    description: "Maximum translucency, depth, motion, and preview throughput.",
+  },
+  {
+    value: "balanced",
+    label: "Balanced",
+    description: "Moderates visual effects and background session work.",
+  },
+  {
+    value: "efficiency",
+    label: "Efficiency",
+    description: "Uses solid surfaces and smaller background batches.",
+  },
+];
+const renderingProfileTuning: Record<
+  RenderingProfile,
+  {
+    initialSessionLimit: number;
+    sessionRenderStep: number;
+    hydrationBatchSize: number;
+    hydrationDelayMs: number;
+  }
+> = {
+  full: {
+    initialSessionLimit: 60,
+    sessionRenderStep: 60,
+    hydrationBatchSize: 60,
+    hydrationDelayMs: 0,
+  },
+  balanced: {
+    initialSessionLimit: 42,
+    sessionRenderStep: 42,
+    hydrationBatchSize: 18,
+    hydrationDelayMs: 40,
+  },
+  efficiency: {
+    initialSessionLimit: 24,
+    sessionRenderStep: 24,
+    hydrationBatchSize: 8,
+    hydrationDelayMs: 100,
+  },
+};
 const metadataFilterTypeOptions: Array<{
   value: MetadataFilterType;
   label: string;
@@ -858,7 +909,8 @@ function appWindowIsActive() {
 function App() {
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [sessionRenderLimit, setSessionRenderLimit] = useState(
-    initialSessionRenderLimit,
+    renderingProfileTuning[defaultSettings.renderingProfile]
+      .initialSessionLimit,
   );
   const [searchMatches, setSearchMatches] = useState<SessionSearchResult[]>([]);
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
@@ -909,6 +961,10 @@ function App() {
   const [tagValue, setTagValue] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<SessionRecord | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [renderingProfileNoticeOpen, setRenderingProfileNoticeOpen] =
+    useState(false);
+  const [renderingProfileNoticeSaving, setRenderingProfileNoticeSaving] =
+    useState(false);
   const [historyTarget, setHistoryTarget] = useState<SessionRecord | null>(null);
   const [sessionHistory, setSessionHistory] = useState<SessionHistory | null>(
     null,
@@ -924,7 +980,9 @@ function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", settings.theme === "dark");
-  }, [settings.theme]);
+    document.documentElement.dataset.renderingProfile =
+      settings.renderingProfile;
+  }, [settings.renderingProfile, settings.theme]);
 
   useEffect(() => {
     if (!toast) {
@@ -1000,6 +1058,13 @@ function App() {
 
         setSettings(nextSettings);
         setProviders(nextProviders);
+        setSessionRenderLimit(
+          renderingProfileTuning[nextSettings.renderingProfile]
+            .initialSessionLimit,
+        );
+        setRenderingProfileNoticeOpen(
+          nextSettings.renderingProfileNoticePending,
+        );
         hydratedSessionVersionsRef.current.clear();
         setSessions(nextSessions);
       } catch (err) {
@@ -1635,10 +1700,12 @@ function App() {
     [allDisplayedSessions, sessionRenderLimit],
   );
   const hasMoreSessions = displayedSessions.length < allDisplayedSessions.length;
+  const activeRenderingTuning = renderingProfileTuning[settings.renderingProfile];
 
   useEffect(() => {
-    setSessionRenderLimit(initialSessionRenderLimit);
+    setSessionRenderLimit(activeRenderingTuning.initialSessionLimit);
   }, [
+    activeRenderingTuning.initialSessionLimit,
     activityFilter,
     collectionFilter,
     metadataFilterType,
@@ -1650,6 +1717,10 @@ function App() {
   ]);
 
   useEffect(() => {
+    if (refreshing) {
+      return;
+    }
+
     const batch = displayedSessions
       .map((session) => ({
         session,
@@ -1660,17 +1731,21 @@ function App() {
           !hydratedSessionVersionsRef.current.has(versionKey) &&
           !hydratingSessionVersionsRef.current.has(versionKey),
       )
-      .slice(0, sessionRenderStep);
+      .slice(0, activeRenderingTuning.hydrationBatchSize);
 
     if (batch.length === 0) {
       return;
     }
 
-    for (const { versionKey } of batch) {
-      hydratingSessionVersionsRef.current.add(versionKey);
-    }
+    let hydrationStarted = false;
 
     async function hydrateCards() {
+      hydrationStarted = true;
+
+      for (const { versionKey } of batch) {
+        hydratingSessionVersionsRef.current.add(versionKey);
+      }
+
       try {
         const details = await api.hydrateSessionCards(
           batch.map(({ session }) => ({
@@ -1721,8 +1796,21 @@ function App() {
       }
     }
 
-    void hydrateCards();
-  }, [displayedSessions, hydrationTick]);
+    const timeoutId = window.setTimeout(
+      () => void hydrateCards(),
+      activeRenderingTuning.hydrationDelayMs,
+    );
+
+    return () => {
+      window.clearTimeout(timeoutId);
+
+      if (!hydrationStarted) {
+        for (const { versionKey } of batch) {
+          hydratingSessionVersionsRef.current.delete(versionKey);
+        }
+      }
+    };
+  }, [activeRenderingTuning, displayedSessions, hydrationTick, refreshing]);
 
   const selectedSessionIndex = useMemo(() => {
     return displayedSessions.findIndex(
@@ -2740,6 +2828,7 @@ function App() {
           noteTarget ||
           tagsTarget ||
           deleteTarget ||
+          renderingProfileNoticeOpen ||
           settingsOpen ||
           historyTarget,
       );
@@ -2767,6 +2856,12 @@ function App() {
         if (statsOpen) {
           event.preventDefault();
           setStatsOpen(false);
+          return;
+        }
+
+        if (renderingProfileNoticeOpen) {
+          event.preventDefault();
+          void acknowledgeRenderingProfileNotice(false);
           return;
         }
 
@@ -2845,6 +2940,7 @@ function App() {
         noteTarget ||
         tagsTarget ||
         deleteTarget ||
+        renderingProfileNoticeOpen ||
         settingsOpen ||
         historyTarget
       ) {
@@ -3017,6 +3113,8 @@ function App() {
     noteTarget,
     refreshData,
     renameTarget,
+    renderingProfileNoticeOpen,
+    renderingProfileNoticeSaving,
     search,
     selectedSession,
     statsOpen,
@@ -3028,10 +3126,39 @@ function App() {
     try {
       await api.saveSettings(nextSettings);
       setSettings(nextSettings);
+      setSessionRenderLimit(
+        renderingProfileTuning[nextSettings.renderingProfile]
+          .initialSessionLimit,
+      );
       setSettingsOpen(false);
       setMessage("Settings saved.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function acknowledgeRenderingProfileNotice(openSettings: boolean) {
+    if (renderingProfileNoticeSaving) {
+      return;
+    }
+
+    setRenderingProfileNoticeSaving(true);
+
+    try {
+      await api.dismissRenderingProfileNotice();
+      setSettings((currentSettings) => ({
+        ...currentSettings,
+        renderingProfileNoticePending: false,
+      }));
+      setRenderingProfileNoticeOpen(false);
+
+      if (openSettings) {
+        setSettingsOpen(true);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRenderingProfileNoticeSaving(false);
     }
   }
 
@@ -3073,7 +3200,7 @@ function App() {
   return (
     <main className="min-h-screen bg-slate-50 text-slate-950 dark:bg-slate-950 dark:text-slate-50">
       <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col px-6 py-6">
-        <header className="sticky top-3 z-20 flex items-center justify-between gap-3 rounded-lg border border-slate-200/80 bg-white/90 px-3.5 py-3 shadow-[0_16px_40px_-32px_rgba(15,23,42,0.85)] backdrop-blur-xl dark:border-white/10 dark:bg-slate-950/90 dark:shadow-black/50 sm:px-4">
+        <header className="sessiondex-glass-surface sticky top-3 z-20 flex items-center justify-between gap-3 rounded-lg border border-slate-200/80 bg-white/90 px-3.5 py-3 shadow-[0_16px_40px_-32px_rgba(15,23,42,0.85)] dark:border-white/10 dark:bg-slate-950/90 dark:shadow-black/50 sm:px-4">
           <div className="flex min-w-0 items-center gap-3">
             <img
               src={appIcon}
@@ -3166,7 +3293,7 @@ function App() {
           </div>
         </header>
 
-        <section className="mt-4 rounded-lg border border-slate-200/80 bg-white/85 p-2 shadow-sm shadow-slate-950/5 backdrop-blur-xl dark:border-white/10 dark:bg-slate-950/80 dark:shadow-black/20">
+        <section className="sessiondex-glass-surface mt-4 rounded-lg border border-slate-200/80 bg-white/85 p-2 shadow-sm shadow-slate-950/5 dark:border-white/10 dark:bg-slate-950/80 dark:shadow-black/20">
           <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
             <div className="grid w-full min-w-0 gap-2 sm:grid-cols-[13rem_minmax(0,1fr)] lg:flex-1">
               <div className="relative">
@@ -3477,7 +3604,7 @@ function App() {
                 >
                   <Card
                     className={cn(
-                      "group relative flex flex-col overflow-hidden p-0 transition-all hover:shadow-md",
+                      "sessiondex-card-surface group relative flex flex-col overflow-hidden p-0 transition-all hover:shadow-md",
                       hasSearchQuery ? "h-[27rem]" : "h-[32rem]",
                       session.isPinned &&
                         "border-amber-200 ring-1 ring-amber-200/70 dark:border-amber-900/80 dark:ring-amber-900/50",
@@ -3691,7 +3818,10 @@ function App() {
             <Button
               variant="secondary"
               onClick={() =>
-                setSessionRenderLimit((current) => current + sessionRenderStep)
+                setSessionRenderLimit(
+                  (current) =>
+                    current + activeRenderingTuning.sessionRenderStep,
+                )
               }
             >
               Load more sessions ({displayedSessions.length} of{" "}
@@ -4192,6 +4322,54 @@ function App() {
         />
       )}
 
+      {renderingProfileNoticeOpen && (
+        <Modal
+          title={`${
+            renderingProfileOptions.find(
+              (profile) => profile.value === settings.renderingProfile,
+            )?.label ?? "Rendering profile"
+          } selected`}
+          onClose={() => void acknowledgeRenderingProfileNotice(false)}
+        >
+          <div className="space-y-4">
+            <div className="flex items-start gap-3 rounded-lg border border-sky-200 bg-sky-50/80 p-3 dark:border-sky-950 dark:bg-sky-950/25">
+              <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-300">
+                <PremiumIcon icon={Gauge} className="h-4 w-4" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-slate-900 dark:text-slate-100">
+                  Tuned for this system
+                </p>
+                <p className="mt-1 text-xs leading-5 text-slate-600 dark:text-slate-300">
+                  SessionDex selected this profile using local CPU, memory, and
+                  graphics capabilities. It reduces some visual effects and
+                  background work to keep interaction responsive.
+                </p>
+              </div>
+            </div>
+            <p className="text-xs leading-5 text-slate-500 dark:text-slate-400">
+              The check stays on this device. You can change the Rendering
+              Profile at any time in Settings.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="ghost"
+                disabled={renderingProfileNoticeSaving}
+                onClick={() => void acknowledgeRenderingProfileNotice(true)}
+              >
+                Review settings
+              </Button>
+              <Button
+                disabled={renderingProfileNoticeSaving}
+                onClick={() => void acknowledgeRenderingProfileNotice(false)}
+              >
+                Continue
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
       {historyTarget && (
         <SessionHistoryModal
           session={historyTarget}
@@ -4365,7 +4543,7 @@ function CommandPalette({
       role="dialog"
       aria-modal="true"
       aria-label="Command palette"
-      className="fixed inset-0 z-[60] bg-slate-950/45 px-4 py-16 backdrop-blur-sm"
+      className="sessiondex-modal-backdrop fixed inset-0 z-[60] bg-slate-950/45 px-4 py-16"
       onKeyDown={handleKeyDown}
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) {
@@ -5111,6 +5289,49 @@ function SettingsModal({
                 Light
               </Button>
             </div>
+          </SettingsSection>
+
+          <SettingsSection icon={Gauge} title="Rendering Profile">
+            <div className="space-y-2">
+              {renderingProfileOptions.map((profile) => {
+                const selected = draft.renderingProfile === profile.value;
+
+                return (
+                  <Button
+                    key={profile.value}
+                    variant={selected ? "primary" : "secondary"}
+                    aria-pressed={selected}
+                    onClick={() =>
+                      setDraft({
+                        ...draft,
+                        renderingProfile: profile.value,
+                      })
+                    }
+                    className="h-auto w-full justify-start rounded-lg px-3 py-2.5 text-left"
+                  >
+                    <span className="min-w-0">
+                      <span className="block text-sm font-semibold">
+                        {profile.label}
+                      </span>
+                      <span
+                        className={cn(
+                          "mt-0.5 block text-xs font-normal leading-4",
+                          selected
+                            ? "text-white/75 dark:text-slate-700"
+                            : "text-slate-500 dark:text-slate-400",
+                        )}
+                      >
+                        {profile.description}
+                      </span>
+                    </span>
+                  </Button>
+                );
+              })}
+            </div>
+            <p className="mt-2 text-xs leading-4 text-slate-500 dark:text-slate-400">
+              SessionDex selects a profile during initial setup using local
+              system capabilities. You can override it at any time.
+            </p>
           </SettingsSection>
 
           <SettingsSection icon={SquareTerminal} title="Detected AI CLIs">
