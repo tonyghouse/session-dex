@@ -3091,18 +3091,46 @@ function App() {
           </div>
 
           <div className="flex shrink-0 items-center gap-1.5">
-            <HeaderActionButton
-              title={
-                isRefreshingSessions
-                  ? "Refreshing sessions"
-                  : "Refresh sessions (F5)"
-              }
-              aria-keyshortcuts="F5 Control+R Meta+R"
-              disabled={isRefreshingSessions}
-              icon={RotateCw}
-              iconClassName={isRefreshingSessions ? "animate-spin" : undefined}
-              onClick={() => void refreshData(true)}
-            />
+            <div className="group/reconciliation relative">
+              <HeaderActionButton
+                title={
+                  refreshing
+                    ? "Reconciling sessions"
+                    : loading
+                      ? "Loading local session index"
+                      : "Refresh sessions (F5)"
+                }
+                aria-keyshortcuts="F5 Control+R Meta+R"
+                disabled={isRefreshingSessions}
+                icon={RotateCw}
+                iconClassName={
+                  refreshing
+                    ? "animate-pulse text-sky-600 dark:text-sky-400"
+                    : undefined
+                }
+                className={refreshing ? "disabled:opacity-100" : undefined}
+                onClick={() => void refreshData(true)}
+              />
+              {refreshing && (
+                <>
+                  <span className="sr-only" role="status" aria-live="polite">
+                    Reconciling provider session files with the local index.
+                  </span>
+                  <div
+                    aria-hidden="true"
+                    className="pointer-events-none invisible absolute right-0 top-full z-30 mt-2.5 w-64 translate-y-1 rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-left opacity-0 shadow-lg shadow-slate-950/10 transition duration-150 group-hover/reconciliation:visible group-hover/reconciliation:translate-y-0 group-hover/reconciliation:opacity-100 dark:border-slate-800 dark:bg-slate-950 dark:shadow-black/30"
+                  >
+                    <p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      Reconciling sessions
+                    </p>
+                    <p className="mt-1 text-[11px] leading-4 text-slate-500 dark:text-slate-400">
+                      Checking provider files, updating the local index, and
+                      cleaning metadata for confirmed external deletions.
+                    </p>
+                  </div>
+                </>
+              )}
+            </div>
             <HeaderActionButton
               title="Command palette (Cmd/Ctrl+Shift+P)"
               aria-keyshortcuts="Control+Shift+P Meta+Shift+P"

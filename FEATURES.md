@@ -293,6 +293,7 @@ SessionDex keeps session data current while staying explicit about user actions.
 What this provides:
 
 - Manual refresh from the header or keyboard.
+- A subtle pulsing refresh indicator appears during reconciliation; hovering it explains that SessionDex is checking provider files, updating the local index, and cleaning confirmed stale metadata.
 - SQLite-first startup rendering followed by mandatory lightweight session reconciliation.
 - Scheduled reconciliation every five minutes while the app window is visible and focused; SessionDex does not keep a continuously running filesystem watcher.
 - A ten-minute overlap around the last successful provider scan protects timestamp-boundary changes.
